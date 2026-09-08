@@ -1,0 +1,49 @@
+services:
+  anonimizzazione-volti:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: anonimizzazione-volti:latest
+    container_name: anonimizzazione-volti
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Overridable defaults (see .env.example for every knob).
+      BIND_ADDR: "0.0.0.0:8080"
+      # Auto-detected when unset (cores ≤ 4 → cores; cores > 4 → cores − 2)
+      MAX_CONCURRENT_IMAGES: "8"
+      CRON_RETRAIN_SCHEDULE: "03:00"    # HH:MM local
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:-change-me-operator-key}"
+      # STORE-output retention (see .env.example for every RETENTION_* knob)
+      RETENTION_ENABLED: "${RETENTION_ENABLED:-true}"
+      RETENTION_MAX_DAYS: "${RETENTION_MAX_DAYS:-30}"
+      RETENTION_MAX_GB: "${RETENTION_MAX_GB:-20.0}"
+    volumes:
+      - models:/app/models
+      - data:/app/data
+      - fp_crops:/app/dataset_falsi_positivi
+      - seed:/app/dataset_seed
+    # Spec §9: minimum 16 GB RAM (32 GB if nightly retraining may overlap a
+    # ZIP job — the embedded PyTorch interpreter is heavy).
+    mem_limit: 32g
+    deploy:
+      resources:
+        limits:
+          memory: 32g
+        reservations:
+          memory: 16g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  models:
+  data:
+  fp_crops:
+  seed:

@@ -1,0 +1,64 @@
+[workspace]
+
+[package]
+name = "anonimizzazione_volti"
+version = "0.1.0"
+edition = "2021"
+description = "Industrial-grade batch face anonymization service (Rust + ONNX)"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+# Streaming the on-disk output ZIP back to the client (ReaderStream over a
+# tokio::fs::File): the /anonymize response never buffers the archive in RAM.
+tokio-util = { version = "0.7", features = ["io"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["download-binaries", "copy-dylibs", "std", "tls-rustls"] }
+axum = { version = "0.7", features = ["multipart"] }
+sqlx = { version = "0.7", default-features = false, features = ["sqlite", "runtime-tokio"] }
+image = "0.24"
+imageproc = "0.23"
+zip = "2.0"
+# liblzma bindings: already compiled into the tree by zip's `xz` feature;
+# used as a robust fallback for LZMA-compressed ZIP entries (method 14) that
+# the zip crate's pure-Rust lzma-rs decoder cannot handle (see zip_worker.rs).
+xz2 = "0.1"
+# Independent decoders used as fallbacks when the zip crate's own decode of a
+# non-standard method (bzip2, zstd, XZ, deflate64) fails: re-read the raw
+# entry and retry, verifying CRC32 + size (see read_entry_bytes).
+bzip2 = "0.5"
+zstd = "0.13"
+deflate64 = "0.1"
+# Non-ZIP archive ingestion: .7z (pure-Rust LZMA/LZMA2 via sevenz-rust) and
+# .rar (unrar 0.5.8 — unrar_sys compiles the bundled unrar C++ source, no
+# system library needed). Both decompress to a scratch dir under DATA_DIR and
+# feed the same per-image pipeline.
+sevenz-rust = "0.5"
+unrar = "0.5"
+# CRC32 for verifying fallback LZMA decodes against the entry's stored checksum.
+crc32fast = "1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "gzip"] }
+ndarray = "0.15"
+geo = "0.28"
+arc-swap = "1.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+
+pyo3 = { version = "0.21", features = ["auto-initialize"], optional = true }
+
+[features]
+default = []
+# PyO3/Python retraining bridge (spec §6). Enabled by default in the Docker
+# build (Dockerfile uses --features retraining with a Python 3.12 base image);
+# keep it off for plain `cargo build` where no Python interpreter is present.
+retraining = ["dep:pyo3"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
