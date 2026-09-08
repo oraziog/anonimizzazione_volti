@@ -21,10 +21,13 @@ pub struct Config {
     pub jpeg_quality: u8,
 
     pub yolo_model_url: String,
+    pub retinaface_model_url: String,
     pub classifier_model_url: Option<String>,
     pub model_cache_dir: PathBuf,
     pub yolo_sha256: Option<String>,
+    pub retinaface_sha256: Option<String>,
     pub classifier_sha256: Option<String>,
+    pub detector_mode: DetectorMode,
 
     pub data_dir: PathBuf,
     pub dataset_fp_dir: PathBuf,
@@ -32,6 +35,11 @@ pub struct Config {
     pub models_backup_dir: PathBuf,
 
     pub yolo_conf_threshold: f32,
+    /// Detector confidence for ACTIVE cameras: usually *lower* than the
+    /// LEARNING threshold — a false negative (unblurred face) is worse for
+    /// GDPR than an extra blur, so ACTIVE leans sensitive (env
+    /// `YOLO_CONF_THRESHOLD_ACTIVE`; falls back to `YOLO_CONF_THRESHOLD`).
+    pub yolo_conf_threshold_active: f32,
     pub yolo_nms_iou: f32,
     pub fp_crop_conf_max: f32,
     pub initial_blur_sigma: f32,
@@ -76,6 +84,24 @@ pub struct Config {
 pub enum AnonMode {
     Blur,
     Pixelate,
+}
+
+/// Face detector backend (env `DETECTOR_MODE`): YOLOv8-Face (default) or the
+/// lightweight MobileNetV1-0.25 RetinaFace export used for benchmarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorMode {
+    Yolo,
+    RetinaFace,
+}
+
+impl DetectorMode {
+    fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yolo" | "yolov8" | "yolov8-face" => Ok(DetectorMode::Yolo),
+            "retinaface" | "retina" => Ok(DetectorMode::RetinaFace),
+            other => anyhow::bail!("DETECTOR_MODE '{other}' must be 'yolo' or 'retinaface'"),
+        }
+    }
 }
 
 impl AnonMode {
@@ -178,6 +204,10 @@ impl Config {
             _ => None,
         };
 
+        let detector_conf = env_parse::<f32>("YOLO_CONF_THRESHOLD", 0.20)?.clamp(0.01, 0.99);
+        let detector_conf_active =
+            env_parse::<f32>("YOLO_CONF_THRESHOLD_ACTIVE", detector_conf)?.clamp(0.01, 0.99);
+
         let cfg = Self {
             bind_addr: env_str("BIND_ADDR", "0.0.0.0:8080"),
             body_limit_bytes: env_parse("BODY_LIMIT_BYTES", 3_758_096_384usize)?,
@@ -188,10 +218,16 @@ impl Config {
                 "YOLO_MODEL_URL",
                 "https://github.com/yakhyo/yolov8-face-onnx-inference/releases/download/weights/yolov8n-face.onnx",
             ),
+            retinaface_model_url: env_str(
+                "RETINAFACE_MODEL_URL",
+                "https://github.com/yakhyo/retinaface-pytorch/releases/download/v0.0.1/retinaface_mv1_0.25.onnx",
+            ),
             classifier_model_url: env_opt("CLASSIFIER_MODEL_URL"),
             model_cache_dir: env_path("MODEL_CACHE_DIR", "/app/models/cache/"),
             yolo_sha256: env_opt("MODEL_YOLO_SHA256"),
+            retinaface_sha256: env_opt("MODEL_RETINAFACE_SHA256"),
             classifier_sha256: env_opt("MODEL_CLASSIFIER_SHA256"),
+            detector_mode: DetectorMode::parse(&env_str("DETECTOR_MODE", "yolo"))?,
 
             data_dir: env_path("DATA_DIR", "/app/data/"),
             dataset_fp_dir: env_path("DATASET_FP_DIR", "/app/dataset_falsi_positivi/"),
@@ -201,8 +237,8 @@ impl Config {
             ),
             models_backup_dir: env_path("MODELS_BACKUP_DIR", "/app/models/backup/"),
 
-            yolo_conf_threshold: env_parse::<f32>("YOLO_CONF_THRESHOLD", 0.20)?
-                .clamp(0.01, 0.99),
+            yolo_conf_threshold: detector_conf,
+            yolo_conf_threshold_active: detector_conf_active,
             yolo_nms_iou: env_parse::<f32>("YOLO_NMS_IOU", 0.45)?.clamp(0.05, 0.95),
             fp_crop_conf_max: env_parse::<f32>("FP_CROP_CONF_MAX", 0.50)?,
             initial_blur_sigma: env_parse::<f32>("INITIAL_BLUR_SIGMA", 20.0)?.max(1.0),
@@ -271,15 +307,19 @@ impl Config {
             max_concurrent_images: Some(2),
             jpeg_quality: 95,
             yolo_model_url: String::new(),
+            retinaface_model_url: String::new(),
             classifier_model_url: None,
             model_cache_dir: PathBuf::from("/tmp/av-models-cache"),
             yolo_sha256: None,
+            retinaface_sha256: None,
             classifier_sha256: None,
+            detector_mode: DetectorMode::Yolo,
             data_dir: PathBuf::from("/tmp/av-data"),
             dataset_fp_dir: PathBuf::from("/tmp/av-fp"),
             dataset_seed_real_faces_dir: PathBuf::from("/tmp/av-seed"),
             models_backup_dir: PathBuf::from("/tmp/av-backup"),
             yolo_conf_threshold: 0.20,
+            yolo_conf_threshold_active: 0.20,
             yolo_nms_iou: 0.45,
             fp_crop_conf_max: 0.50,
             initial_blur_sigma: 20.0,

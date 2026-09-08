@@ -24,8 +24,12 @@ __pycache__/
 Mio_Test.zip
 Mio_Test_elaborato.zip
 WIDER_val.zip
+WIDER_val_elaborato.zip
 Mio_Test/
 eval_full_conf001.out
+testdata/
+testfp/
+*.log
 
 # Temp
 .freebuff/

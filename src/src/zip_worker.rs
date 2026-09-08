@@ -1263,6 +1263,7 @@ fn process_one_image(
         error: None,
     };
 
+    let t0 = std::time::Instant::now();
     let decoded = match image::load_from_memory(&bytes) {
         Ok(img) => img,
         Err(e) => {
@@ -1272,10 +1273,12 @@ fn process_one_image(
             return outcome;
         }
     };
+    let t_decode = t0.elapsed();
     let rgb = decoded.to_rgb8();
     let (w, h) = rgb.dimensions();
     outcome.frame_size = Some((w, h));
 
+    let t1 = std::time::Instant::now();
     let res = process_image(cfg, store, job.state, job.roi_json.as_deref(), &rgb);
     let (processed, detections, fp_crops, branch) = match res {
         Ok(out) => {
@@ -1308,6 +1311,7 @@ fn process_one_image(
             (rgba, Vec::new(), Vec::new(), Branch::Initial)
         }
     };
+    let t_process = t1.elapsed();
     outcome.branch = branch;
 
     // Persist false-positive crops for retraining (§4):
@@ -1325,7 +1329,9 @@ fn process_one_image(
     }
 
     // Encode the processed frame back to the original format.
+    let t2 = std::time::Instant::now();
     let enc_result = encode_frame(&processed, w, h, job.image_format, cfg.jpeg_quality);
+    let t_encode = t2.elapsed();
     match enc_result {
         Ok(payload) => outcome.payload = Some(payload),
         Err(e) => {
@@ -1334,6 +1340,19 @@ fn process_one_image(
             tracing::error!("encode failed for {}: {e}", job.out_name);
         }
     }
+
+    let total = t0.elapsed();
+    let det = detections.len();
+    tracing::info!(
+        target: "perf",
+        camera = %job.camera_id,
+        detect = det,
+        decode_ms = t_decode.as_secs_f64() * 1000.0,
+        process_ms = t_process.as_secs_f64() * 1000.0,
+        encode_ms = t_encode.as_secs_f64() * 1000.0,
+        total_ms = total.as_secs_f64() * 1000.0,
+        "per-image timing"
+    );
 
     outcome.detections = detections;
     outcome

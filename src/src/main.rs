@@ -48,7 +48,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use crate::config::Config;
+use crate::config::{Config, DetectorMode};
 use crate::db::{Camera, Db};
 use crate::model_loader::ensure_model;
 use crate::models::{ModelStore, SessionPool};
@@ -137,21 +137,27 @@ async fn run() -> Result<()> {
         .build()
         .context("build HTTP client")?;
 
-    let yolo = ensure_model(
-        &http,
-        &cfg.yolo_model_url,
-        cfg.yolo_sha256.as_deref(),
-        &cfg.model_cache_dir,
-    )
-    .await
-    .with_context(|| "YOLOv8-Face model resolution failed")?;
+    let (detector_url, detector_sha) = match cfg.detector_mode {
+        DetectorMode::Yolo => (cfg.yolo_model_url.as_str(), cfg.yolo_sha256.as_deref()),
+        DetectorMode::RetinaFace => (
+            cfg.retinaface_model_url.as_str(),
+            cfg.retinaface_sha256.as_deref(),
+        ),
+    };
+    let detector = ensure_model(&http, detector_url, detector_sha, &cfg.model_cache_dir)
+        .await
+        .with_context(|| "face detector model resolution failed")?;
     // Validate that the file is a loadable ONNX before serving (§3).
-    model_loader::load_session(&yolo.path)
-        .with_context(|| format!("YOLO model not loadable: {}", yolo.path.display()))?;
+    model_loader::load_session(&detector.path)
+        .with_context(|| format!("detector model not loadable: {}", detector.path.display()))?;
     tracing::info!(
-        "YOLO model ready at {} (downloaded: {})",
-        yolo.path.display(),
-        yolo.downloaded
+        "{} model ready at {} (downloaded: {})",
+        match cfg.detector_mode {
+            DetectorMode::Yolo => "YOLOv8-Face",
+            DetectorMode::RetinaFace => "RetinaFace (mobile0.25)",
+        },
+        detector.path.display(),
+        detector.downloaded
     );
 
     let classifier_pool = match cfg.classifier_model_url.as_deref() {
@@ -188,7 +194,7 @@ async fn run() -> Result<()> {
         .context("open SQLite database")?;
 
     let store = ModelStore::new(
-        SessionPool::new(yolo.path.clone(), cfg.effective_concurrency()),
+        SessionPool::new(detector.path.clone(), cfg.effective_concurrency()),
         classifier_pool,
     );
 

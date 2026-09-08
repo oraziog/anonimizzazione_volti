@@ -11,7 +11,7 @@ use image::{DynamicImage, Rgba};
 
 use crate::config::{AnonMode, Config};
 use crate::db::CameraState;
-use crate::models::{run_classifier, run_yolo, FaceDetection, Keypoints, ModelStore, Rect};
+use crate::models::{run_classifier, run_detector, FaceDetection, Keypoints, ModelStore, Rect};
 use crate::roi::RoiPolygon;
 
 /// Which FSM branch processed the image (used for logging/metrics).
@@ -491,10 +491,7 @@ pub fn process_image(
             })
         }
         CameraState::Learning => {
-            let mut session = store.yolo.acquire()?;
-            let detections =
-                run_yolo(&mut session, img, cfg.yolo_conf_threshold, cfg.yolo_nms_iou)?;
-            drop(session);
+            let detections = run_detector(cfg, store, img, cfg.yolo_conf_threshold)?;
 
             let mut rgba = DynamicImage::ImageRgb8(img.clone()).to_rgba8();
             for det in &detections {
@@ -529,10 +526,8 @@ pub fn process_image(
             // considered (spec §4 ACTIVE).
             let roi = roi_json.and_then(RoiPolygon::from_json);
 
-            let mut session = store.yolo.acquire()?;
             let detections =
-                run_yolo(&mut session, img, cfg.yolo_conf_threshold, cfg.yolo_nms_iou)?;
-            drop(session);
+                run_detector(cfg, store, img, cfg.yolo_conf_threshold_active)?;
 
             let mut rgba = DynamicImage::ImageRgb8(img.clone()).to_rgba8();
             let mut kept: Vec<FaceDetection> = Vec::new();
