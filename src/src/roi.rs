@@ -115,6 +115,88 @@ impl RoiPolygon {
     }
 }
 
+/// Outcome of comparing a freshly re-extracted candidate ROI with the
+/// deployed one (dynamic-ROI stability guard).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoiDecision {
+    /// No deployed ROI (first ACTIVE) — adopt the candidate.
+    Replace,
+    /// Frame geometry changed — adopt: the polygon is expressed in the new
+    /// pixel space and the old one is not comparable.
+    GeometryChanged,
+    /// Candidate ~overlaps the deployed ROI (`IoU ≥ min_iou`) — keep the
+    /// deployed polygon to avoid flapping on PTZ/scene noise.
+    KeepStable { iou: f64 },
+}
+
+/// Grid-based IoU approximation between two ROIs living in the same frame
+/// space (dimensions are compared on the *maximum* of the two, callers ensure
+/// comparable geometry). Cheap and deterministic: a few thousand ray-casting
+/// samples on a coarse cell grid, plenty for a nightly stability check.
+pub fn polygon_iou(a: &RoiPolygon, b: &RoiPolygon) -> f64 {
+    let w = a.image_width.max(b.image_width) as i64;
+    let h = a.image_height.max(b.image_height) as i64;
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    // Cell side ≈ 1/96 of the larger frame side (≥ 1 px).
+    let cell = (((w.max(h)) as f64 / 96.0).ceil() as i64).max(1);
+    let mut inter = 0u64;
+    let mut in_a = 0u64;
+    let mut in_b = 0u64;
+    let mut i = 0;
+    while i < w {
+        let mut j = 0;
+        while j < h {
+            let (x, y) = (i as f64, j as f64);
+            let ia = a.contains(x, y);
+            let ib = b.contains(x, y);
+            if ia {
+                in_a += 1;
+            }
+            if ib {
+                in_b += 1;
+            }
+            if ia && ib {
+                inter += 1;
+            }
+            j += cell;
+        }
+        i += cell;
+    }
+    let union = in_a + in_b - inter;
+    if union == 0 {
+        return 0.0;
+    }
+    inter as f64 / union as f64
+}
+
+/// Applies the dynamic-ROI stability guard. `current` is the deployed
+/// polygon (if any), `candidate` the freshly extracted one.
+pub fn decide_roi(
+    current: Option<&RoiPolygon>,
+    candidate: &RoiPolygon,
+    min_iou: f64,
+) -> RoiDecision {
+    match current {
+        None => RoiDecision::Replace,
+        Some(cur) => {
+            if cur.image_width != candidate.image_width
+                || cur.image_height != candidate.image_height
+            {
+                RoiDecision::GeometryChanged
+            } else {
+                let iou = polygon_iou(cur, candidate);
+                if iou >= min_iou {
+                    RoiDecision::KeepStable { iou }
+                } else {
+                    RoiDecision::Replace
+                }
+            }
+        }
+    }
+}
+
 /// Full extraction pipeline (spec §5, ordered steps 2–7).
 #[allow(clippy::too_many_arguments)] // all parameters are spec §5.2 tunables
 pub fn extract_roi(
@@ -425,5 +507,87 @@ mod tests {
         assert!(roi.contains(50.0, 50.0));
         assert!(!roi.contains(150.0, 50.0));
         assert!(roi.contains(0.0, 50.0)); // edge counts as inside (ray casting)
+    }
+
+    fn frame_rect(w: u32, h: u32) -> RoiPolygon {
+        RoiPolygon {
+            polygon: vec![[0.0, 0.0], [w as f64 - 1.0, 0.0], [w as f64 - 1.0, h as f64 - 1.0], [0.0, h as f64 - 1.0]],
+            image_width: w,
+            image_height: h,
+            area_ratio: 1.0,
+        }
+    }
+
+    fn half_frame_right(w: u32, h: u32) -> RoiPolygon {
+        let half = w as f64 / 2.0;
+        RoiPolygon {
+            polygon: vec![[half, 0.0], [w as f64 - 1.0, 0.0], [w as f64 - 1.0, h as f64 - 1.0], [half, h as f64 - 1.0]],
+            image_width: w,
+            image_height: h,
+            area_ratio: 0.5,
+        }
+    }
+
+    fn half_frame_left(w: u32, h: u32) -> RoiPolygon {
+        let half = w as f64 / 2.0;
+        RoiPolygon {
+            polygon: vec![[0.0, 0.0], [half, 0.0], [half, h as f64 - 1.0], [0.0, h as f64 - 1.0]],
+            image_width: w,
+            image_height: h,
+            area_ratio: 0.5,
+        }
+    }
+
+    #[test]
+    fn polygon_iou_identical_disjoint_and_half_overlap() {
+        // Identical polygons (same rounding via grid) → ~1.0.
+        let a = frame_rect(200, 100);
+        let iou_same = polygon_iou(&a, &frame_rect(200, 100));
+        assert!(iou_same > 0.99, "identical ROI should be ~1, got {iou_same}");
+
+        // Disjoint (left half vs right half, no shared cell) → 0.
+        let left = half_frame_left(200, 100);
+        let right = half_frame_right(200, 100);
+        let iou_disjoint = polygon_iou(&left, &right);
+        assert!(iou_disjoint < 0.05, "disjoint ROI should be ~0, got {iou_disjoint}");
+
+        // Same frame, full vs right-half → IoU ≈ area(right)/area(full) = 0.5
+        // (union = full, intersection = right half).
+        let iou_half = polygon_iou(&frame_rect(200, 100), &right);
+        assert!(iou_half > 0.45 && iou_half < 0.55, "expected ~0.5, got {iou_half}");
+    }
+
+    #[test]
+    fn decide_roi_stability_guard() {
+        let current = frame_rect(200, 100);
+
+        // No deployed ROI → replace.
+        assert_eq!(decide_roi(None, &current, 0.6), RoiDecision::Replace);
+
+        // Nearly identical → keep (stable).
+        let almost = frame_rect(200, 100);
+        match decide_roi(Some(&current), &almost, 0.6) {
+            RoiDecision::KeepStable { iou } => assert!(iou >= 0.99),
+            other => panic!("expected KeepStable, got {other:?}"),
+        }
+
+        // Frame geometry changed → replace even if polygons coincide.
+        assert_eq!(
+            decide_roi(Some(&current), &frame_rect(400, 100), 0.6),
+            RoiDecision::GeometryChanged
+        );
+
+        // Big difference (half-frame shift) → replace.
+        let right = half_frame_right(200, 100);
+        assert_eq!(
+            decide_roi(Some(&current), &right, 0.6),
+            RoiDecision::Replace
+        );
+
+        // …but a permissive IoU threshold keeps it stable.
+        match decide_roi(Some(&current), &right, 0.4) {
+            RoiDecision::KeepStable { iou } => assert!(iou >= 0.4),
+            other => panic!("expected KeepStable with permissive threshold, got {other:?}"),
+        }
     }
 }

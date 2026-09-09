@@ -102,6 +102,16 @@ fn normalize_path(mut p: &str) -> String {
     out
 }
 
+/// Output name with the extension replaced by `new_ext` (directory layout
+/// preserved). Used when `OUTPUT_FORMAT` forces a conversion: an entry keeps
+/// its path, only the suffix changes (e.g. `CAM_001/frame_1.PNG` → `.png`).
+fn replace_ext(name: &str, new_ext: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.{new_ext}"),
+        None => format!("{name}.{new_ext}"),
+    }
+}
+
 /// Classifies an archive entry path (spec §2: folder style `CAM_001/foto.jpg`
 /// or prefix style `CAM_001_foto.jpg`; anything else is an error — never a
 /// panic).
@@ -243,6 +253,29 @@ impl ZipProcessor {
         self.errors.load(Ordering::Relaxed)
     }
 
+    /// Resolved data dir of this processor (the S3 worker stages its scratch
+    /// files there so uploads/downloads never hit cross-device copies).
+    #[cfg(feature = "s3")]
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.cfg.data_dir
+    }
+
+    /// Resolves a camera row once per camera id per job: the first image of a
+    /// camera queries/creates the row, all subsequent frames reuse the cached
+    /// snapshot. Saves one sqlite roundtrip (and a transaction) per frame.
+    async fn camera_for(
+        &self,
+        cache: &mut HashMap<String, Camera>,
+        id: &str,
+    ) -> Result<Camera> {
+        if let Some(cam) = cache.get(id) {
+            return Ok(cam.clone());
+        }
+        let cam = self.db.get_or_create_camera(id).await?;
+        cache.insert(id.to_string(), cam.clone());
+        Ok(cam)
+    }
+
     /// Dispatches an uploaded archive (already spooled to disk by the HTTP
     /// handler) by extension: .zip is opened as a file-backed `ZipArchive`
     /// (the main path), .7z / .rar decompress from the file into a scratch dir
@@ -327,6 +360,7 @@ impl ZipProcessor {
         // Pass 2: schedule all images. Reads are sequential (ZipArchive is
         // borrowed by this loop); decode + inference + blur run in parallel
         // under the semaphore.
+        let mut cam_cache: HashMap<String, Camera> = HashMap::new();
         for (idx, target) in image_entries.into_iter() {
             let permit = self
                 .semaphore
@@ -352,7 +386,7 @@ impl ZipProcessor {
             };
 
             // Camera FSM bookkeeping lives on the async side (sqlx).
-            let cam = match self.db.get_or_create_camera(&target.camera_id).await {
+            let cam = match self.camera_for(&mut cam_cache, &target.camera_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
@@ -674,6 +708,7 @@ impl ZipProcessor {
             tokio::task::JoinSet::new();
 
         // Pass 2: read from disk + schedule under the semaphore.
+        let mut cam_cache: HashMap<String, Camera> = HashMap::new();
         for (path, target) in image_entries.into_iter() {
             let permit = self
                 .semaphore
@@ -696,7 +731,7 @@ impl ZipProcessor {
                 }
             };
 
-            let cam = match self.db.get_or_create_camera(&target.camera_id).await {
+            let cam = match self.camera_for(&mut cam_cache, &target.camera_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
@@ -1253,8 +1288,16 @@ fn process_one_image(
     job_stamp: &str,
     errors: Arc<AtomicUsize>,
 ) -> ImageOutcome {
+    // OUTPUT_FORMAT override: `keep` preserves the input format, otherwise the
+    // frame is re-encoded as JPEG/PNG and its output entry renamed to `.jpg`/
+    // `.png` (the directory layout is unchanged).
+    let (out_name, format) = match cfg.output_format {
+        crate::config::OutputFormat::Keep => (job.out_name.clone(), job.image_format),
+        crate::config::OutputFormat::Jpeg => (replace_ext(&job.out_name, "jpg"), ImageFormat::Jpeg),
+        crate::config::OutputFormat::Png => (replace_ext(&job.out_name, "png"), ImageFormat::Png),
+    };
     let mut outcome = ImageOutcome {
-        out_name: job.out_name.clone(),
+        out_name,
         branch: Branch::Initial,
         payload: None,
         detections: Vec::new(),
@@ -1328,9 +1371,26 @@ fn process_one_image(
         }
     }
 
-    // Encode the processed frame back to the original format.
+    // OUTPUT_MAX_SIDE: downscale after anonymization so the archive payloads
+    // shrink while the stored camera geometry (frame_size) stays the original.
+    let max_side = cfg.output_max_side_px;
+    let (processed, ew, eh) = if max_side > 0 && w.max(h) > max_side {
+        let k = max_side as f64 / w.max(h) as f64;
+        let (ew, eh) = (((w as f64 * k) as u32).max(1), ((h as f64 * k) as u32).max(1));
+        let resized = image::imageops::resize(
+            &processed,
+            ew,
+            eh,
+            image::imageops::FilterType::Triangle,
+        );
+        (resized, ew, eh)
+    } else {
+        (processed, w, h)
+    };
+
+    // Encode the processed frame (converted format if OUTPUT_FORMAT is set).
     let t2 = std::time::Instant::now();
-    let enc_result = encode_frame(&processed, w, h, job.image_format, cfg.jpeg_quality);
+    let enc_result = encode_frame(&processed, ew, eh, format, cfg.jpeg_quality);
     let t_encode = t2.elapsed();
     match enc_result {
         Ok(payload) => outcome.payload = Some(payload),
@@ -1366,21 +1426,33 @@ fn encode_frame(
     jpeg_quality: u8,
 ) -> Result<Vec<u8>> {
     use image::ImageEncoder;
-    let rgb8 = image::DynamicImage::ImageRgba8(rgba.clone()).to_rgb8();
+    // RGBA→RGB by direct copy (single allocation, no full-frame clone).
+    let rgb: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+        image::ImageBuffer::from_fn(w, h, |x, y| {
+            let c = rgba.get_pixel(x, y).0;
+            image::Rgb([c[0], c[1], c[2]])
+        });
     match format {
         ImageFormat::Jpeg => {
-            let mut buf = Cursor::new(Vec::new());
-            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, jpeg_quality);
-            enc.write_image(rgb8.as_raw(), w, h, image::ColorType::Rgb8)
-                .map_err(|e| anyhow!("jpeg encode: {e}"))?;
-            Ok(buf.into_inner())
+            let mut buf = Vec::with_capacity((w as usize) * (h as usize) / 2);
+            {
+                let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    &mut buf,
+                    jpeg_quality,
+                );
+                enc.write_image(rgb.as_raw(), w, h, image::ColorType::Rgb8)
+                    .map_err(|e| anyhow!("jpeg encode: {e}"))?;
+            }
+            Ok(buf)
         }
         ImageFormat::Png => {
-            let mut buf = Cursor::new(Vec::new());
-            let enc = image::codecs::png::PngEncoder::new(&mut buf);
-            enc.write_image(rgb8.as_raw(), w, h, image::ColorType::Rgb8)
-                .map_err(|e| anyhow!("png encode: {e}"))?;
-            Ok(buf.into_inner())
+            let mut buf = Vec::with_capacity((w as usize) * (h as usize) / 2);
+            {
+                let enc = image::codecs::png::PngEncoder::new(&mut buf);
+                enc.write_image(rgb.as_raw(), w, h, image::ColorType::Rgb8)
+                    .map_err(|e| anyhow!("png encode: {e}"))?;
+            }
+            Ok(buf)
         }
     }
 }
@@ -1423,6 +1495,7 @@ mod tests {
     fn store_without_models() -> ModelStore {
         ModelStore::new(
             crate::models::SessionPool::new(PathBuf::from("/nonexistent/test-model.onnx"), 1),
+            None,
             None,
         )
     }
@@ -1901,5 +1974,116 @@ mod tests {
         let names = zip_entry_names(&std::fs::read(&outcome.output_path).unwrap());
         assert!(names.contains(&"CAM_001/frame1.jpg".to_string()));
         assert!(names.contains(&"x_error.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn output_format_converts_formats_and_renames_entries() {
+        // Jpeg: a PNG input is re-encoded as JPEG and its entry renamed to
+        // .jpg; the JPEG input stays .jpg. INITIAL branch, no models needed.
+        let dir = test_temp_dir("convert_jpeg");
+        let mut cfg = test_cfg(&dir);
+        cfg.output_format = crate::config::OutputFormat::Jpeg;
+        let db = Db::open(&dir.join("t.sqlite3")).await.unwrap();
+        for cam in ["CAM_001", "CAM_002"] {
+            db.get_or_create_camera(cam).await.unwrap();
+            db.reset_to_initial(cam).await.unwrap();
+        }
+        let jpeg = synthetic_image(48, 32, ImageFormat::Jpeg);
+        let png = synthetic_image(40, 40, ImageFormat::Png);
+        let zip_bytes = build_zip(&[
+            ("CAM_001/a.jpg", jpeg.as_slice()),
+            ("CAM_002/b.png", png.as_slice()),
+        ]);
+        let spool = dir.join("up.zip");
+        std::fs::write(&spool, &zip_bytes).unwrap();
+        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let outcome = processor
+            .process_archive_file("up.zip", &spool)
+            .await
+            .unwrap();
+        assert_eq!(outcome.processed_count, 2);
+        let out_bytes = std::fs::read(&outcome.output_path).unwrap();
+        let names = zip_entry_names(&out_bytes);
+        for want in ["CAM_001/a.jpg", "CAM_002/b.jpg"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "missing {want} in {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "CAM_002/b.png"),
+            "old png name must be gone: {names:?}"
+        );
+        let mut archive = zip::ZipArchive::new(Cursor::new(&out_bytes)).unwrap();
+        for name in ["CAM_001/a.jpg", "CAM_002/b.jpg"] {
+            let mut e = archive.by_name(name).unwrap();
+            let mut bytes = Vec::new();
+            e.read_to_end(&mut bytes).unwrap();
+            assert!(
+                image::load_from_memory(&bytes).is_ok(),
+                "{name} is not a decodable image"
+            );
+        }
+
+        // Png: both inputs re-encoded lossless as .png.
+        let dir2 = test_temp_dir("convert_png");
+        let mut cfg2 = test_cfg(&dir2);
+        cfg2.output_format = crate::config::OutputFormat::Png;
+        let db2 = Db::open(&dir2.join("t.sqlite3")).await.unwrap();
+        db2.get_or_create_camera("CAM_001").await.unwrap();
+        db2.reset_to_initial("CAM_001").await.unwrap();
+        let zip2 = build_zip(&[("CAM_001/a.jpg", jpeg.as_slice())]);
+        let spool2 = dir2.join("up.zip");
+        std::fs::write(&spool2, &zip2).unwrap();
+        let p2 = ZipProcessor::new(Arc::new(cfg2.clone()), db2, store_without_models());
+        let out2 = p2
+            .process_archive_file("up.zip", &spool2)
+            .await
+            .unwrap();
+        let names2 = zip_entry_names(&std::fs::read(&out2.output_path).unwrap());
+        assert!(
+            names2.iter().any(|n| n == "CAM_001/a.png"),
+            "{names2:?}"
+        );
+        assert!(
+            !names2.iter().any(|n| n == "CAM_001/a.jpg"),
+            "old jpg name must be gone: {names2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_downscales_to_max_side_after_anonymization() {
+        let dir = test_temp_dir("downscale");
+        let mut cfg = test_cfg(&dir);
+        cfg.output_max_side_px = 16;
+        let db = Db::open(&dir.join("t.sqlite3")).await.unwrap();
+        db.get_or_create_camera("CAM_001").await.unwrap();
+        db.reset_to_initial("CAM_001").await.unwrap();
+        let jpeg = synthetic_image(48, 32, ImageFormat::Jpeg);
+        let zip_bytes = build_zip(&[("CAM_001/frame1.jpg", jpeg.as_slice())]);
+        let spool = dir.join("up.zip");
+        std::fs::write(&spool, &zip_bytes).unwrap();
+        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let outcome = processor
+            .process_archive_file("up.zip", &spool)
+            .await
+            .unwrap();
+        assert_eq!(outcome.processed_count, 1);
+        let out_bytes = std::fs::read(&outcome.output_path).unwrap();
+        let names = zip_entry_names(&out_bytes);
+        assert!(
+            names.contains(&"CAM_001/frame1.jpg".to_string()),
+            "keep format must not rename the entry: {names:?}"
+        );
+        let mut archive = zip::ZipArchive::new(Cursor::new(&out_bytes)).unwrap();
+        let mut e = archive.by_name("CAM_001/frame1.jpg").unwrap();
+        let mut bytes = Vec::new();
+        e.read_to_end(&mut bytes).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(
+            img.dimensions(),
+            (16, 10),
+            "48x32 downscaled to max side 16 keeps the aspect ratio"
+        );
     }
 }

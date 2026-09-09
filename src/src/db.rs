@@ -244,25 +244,31 @@ impl Db {
         Ok(())
     }
 
-    /// Appends detection center points collected during LEARNING.
+    /// Appends detection center points collected during LEARNING. Inserted in
+    /// multi-row VALUES chunks (500 rows per statement — one statement is
+    /// atomic on SQLite), so a camera with thousands of detections writes a
+    /// handful of short transactions instead of one row per roundtrip.
     pub async fn insert_detections(&self, detections: &[Detection]) -> Result<()> {
         if detections.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
-        for d in detections {
-            sqlx::query(
-                "INSERT INTO detections (camera_id, x, y, confidence, captured_at) VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(&d.camera_id)
-            .bind(d.x)
-            .bind(d.y)
-            .bind(d.confidence)
-            .bind(d.captured_at.to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
+        const CHUNK: usize = 500;
+        for chunk in detections.chunks(CHUNK) {
+            let values = vec!["(?, ?, ?, ?, ?)"; chunk.len()].join(",");
+            let sql = format!(
+                "INSERT INTO detections (camera_id, x, y, confidence, captured_at) VALUES {values}"
+            );
+            let mut q = sqlx::query(&sql);
+            for d in chunk {
+                q = q
+                    .bind(&d.camera_id)
+                    .bind(d.x)
+                    .bind(d.y)
+                    .bind(d.confidence)
+                    .bind(d.captured_at.to_rfc3339());
+            }
+            q.execute(&self.pool).await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -276,6 +282,37 @@ impl Db {
             .into_iter()
             .map(|r| (r.get::<f64, _>("x") as f32, r.get::<f64, _>("y") as f32))
             .collect())
+    }
+
+    /// Detection coordinates recorded since `since` for a camera (dynamic-ROI
+    /// re-extraction window — see `ROI_REEXTRACT_WINDOW_DAYS`).
+    pub async fn detections_for_camera_since(
+        &self,
+        id: &str,
+        since: &DateTime<Utc>,
+    ) -> Result<Vec<(f32, f32)>> {
+        let rows = sqlx::query(
+            "SELECT x, y FROM detections WHERE camera_id = ? AND captured_at >= ?",
+        )
+        .bind(id)
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<f64, _>("x") as f32, r.get::<f64, _>("y") as f32))
+            .collect())
+    }
+
+    /// Deletes detections older than `cutoff`; returns the number of rows
+    /// removed. Bounds the table to the retention horizon of the ROI
+    /// extraction (nightly task, see `background_loop`).
+    pub async fn prune_detections_older_than(&self, cutoff: &DateTime<Utc>) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM detections WHERE captured_at < ?")
+            .bind(cutoff.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     /// Cameras whose LEARNING period has elapsed (for the nightly ROI task).
@@ -395,5 +432,40 @@ mod tests {
         let cam = db.camera_by_id("CAM_002").await.unwrap().unwrap();
         assert_eq!(cam.state, CameraState::Initial);
         assert!(cam.roi_json.is_none());
+    }
+
+    #[tokio::test]
+    async fn detections_since_and_pruning() {
+        let db = temp_db().await;
+        db.get_or_create_camera("CAM_003").await.unwrap();
+        let now = Utc::now();
+        db.insert_detections(&[
+            Detection {
+                camera_id: "CAM_003".into(),
+                x: 1.0,
+                y: 2.0,
+                confidence: 0.9,
+                captured_at: now,
+            },
+            Detection {
+                camera_id: "CAM_003".into(),
+                x: 3.0,
+                y: 4.0,
+                confidence: 0.8,
+                captured_at: now - chrono::Duration::days(10),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let since = now - chrono::Duration::days(3);
+        let recent = db.detections_for_camera_since("CAM_003", &since).await.unwrap();
+        assert_eq!(recent.len(), 1, "only the recent detection survives the window");
+
+        // Pruning with a 5-day cutoff removes the 10-day-old row.
+        let cutoff = now - chrono::Duration::days(5);
+        let removed = db.prune_detections_older_than(&cutoff).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(db.detections_for_camera("CAM_003").await.unwrap().len(), 1);
     }
 }

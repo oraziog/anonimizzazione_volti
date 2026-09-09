@@ -11,11 +11,14 @@ RUN apt-get update \
 WORKDIR /app
 COPY . .
 
-# Build the service with nightly retraining enabled (spec §6). CPU ONNX
-# Runtime binaries are fetched by ort's download-binaries feature at build
-# time; PYO3_NO_PYTHON avoids surprises with stray interpreters.
+# Build the service (spec §6). CPU ONNX Runtime binaries are fetched by ort's
+# download-binaries feature at build time; PYO3_NO_PYTHON avoids surprises
+# with stray interpreters.
+# Default: nightly retraining. Extend via build arg (e.g. `FEATURES=retraining,s3`
+# for the S3 backend, or `retraining,cuda` for GPU — see Dockerfile.gpu).
+ARG FEATURES=retraining
 ENV PYO3_PYTHON=python3
-RUN cargo build --release --features retraining
+RUN cargo build --release --features "$FEATURES"
 
 # ── Runtime ─────────────────────────────────────────────────────────────────
 FROM python:3.11-slim

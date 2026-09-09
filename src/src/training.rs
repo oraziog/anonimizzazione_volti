@@ -41,6 +41,14 @@ pub struct RetrainAudit {
     pub python_train_samples: Option<u64>,
     pub epochs_run: Option<u64>,
     pub rust_validation_accuracy: Option<f64>,
+    /// Accuracy of the deployed classifier on the same deterministic holdout
+    /// (`None` on the very first swap): the A/B comparison baseline.
+    pub current_accuracy: Option<f64>,
+    /// Path of the deployed classifier the candidate was compared against.
+    pub current_onnx: Option<String>,
+    /// How many consumed false-positive crops were cleared after a successful
+    /// swap (the model already learned on them; next run starts fresh).
+    pub cleared_fp_crops: Option<usize>,
     pub min_accuracy: f32,
     pub candidate_onnx: Option<String>,
     pub backup_onnx: Option<String>,
@@ -87,6 +95,9 @@ pub async fn nightly_retrain(cfg: &Config, store: &ModelStore) -> Result<Retrain
         python_train_samples: None,
         epochs_run: None,
         rust_validation_accuracy: None,
+        current_accuracy: None,
+        current_onnx: None,
+        cleared_fp_crops: None,
         min_accuracy: cfg.retrain_min_accuracy,
         candidate_onnx: None,
         backup_onnx: None,
@@ -98,6 +109,15 @@ pub async fn nightly_retrain(cfg: &Config, store: &ModelStore) -> Result<Retrain
         audit.status = "failed".to_string();
         audit.error = Some(format!("{e:#}"));
         audit.reason = Some(format!("retraining aborted: {e:#}"));
+    }
+
+    // On skipped/failed runs this run produced no A/B baseline: expose the
+    // deployed model recorded at the last successful swap instead.
+    if audit.current_accuracy.is_none() {
+        if let Some(st) = read_classifier_state(cfg) {
+            audit.current_accuracy = Some(st.accuracy);
+            audit.current_onnx = Some(st.active_onnx);
+        }
     }
 
     tracing::info!("nightly retraining audit: {}", audit.summary_line());
@@ -205,6 +225,48 @@ async fn retrain_inner(cfg: &Config, store: &ModelStore, audit: &mut RetrainAudi
         return Ok(());
     }
 
+    // A/B gate: a retrained candidate must not degrade the deployed model.
+    // `validate_exported_model` uses the same deterministic holdout for both
+    // (`sample_images` is sorted and truncated), so the comparison is fair.
+    // RetrainAudit carries the baseline so the operator can see it.
+    if let Some(current) = store.classifier_pool() {
+        let current_path = current.path();
+        if current_path != &out_onnx && current_path.exists() {
+            match validate_exported_model(current_path, seed_dir, fp_dir) {
+                Ok(current_acc) => {
+                    audit.current_accuracy = Some(current_acc);
+                    audit.current_onnx = Some(current_path.to_string_lossy().to_string());
+                    let floor = current_acc - cfg.retrain_regression_eps as f64;
+                    if rust_acc < floor {
+                        discard(&out_onnx, &metrics_path);
+                        audit.status = "rejected".to_string();
+                        audit.reason = Some(format!(
+                            "candidate {rust_acc:.4} below deployed model {current_acc:.4} \
+                             (regression eps {})",
+                            cfg.retrain_regression_eps
+                        ));
+                        tracing::warn!(
+                            "candidate classifier {rust_acc:.4} < deployed {current_acc:.4} \
+                             (eps {}): kept the deployed model",
+                            cfg.retrain_regression_eps
+                        );
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    // Cannot establish the baseline → keep the deployed model.
+                    discard(&out_onnx, &metrics_path);
+                    audit.status = "rejected".to_string();
+                    audit.reason = Some(format!(
+                        "cannot validate the deployed classifier as A/B baseline: {e:#}"
+                    ));
+                    tracing::warn!("A/B baseline validation failed: {e:#}");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // Backup previous classifier for manual rollback (§6).
     let mut backup = None;
     if let Some(current) = store.classifier_pool() {
@@ -214,7 +276,7 @@ async fn retrain_inner(cfg: &Config, store: &ModelStore, audit: &mut RetrainAudi
             if let Err(e) = std::fs::copy(src, &b) {
                 tracing::warn!("cannot back up previous classifier to {}: {e}", b.display());
             } else {
-                backup = Some(b);
+                backup = Some(b.clone());
                 audit.backup_onnx = Some(b.to_string_lossy().to_string());
             }
         }
@@ -226,7 +288,11 @@ async fn retrain_inner(cfg: &Config, store: &ModelStore, audit: &mut RetrainAudi
     ));
     audit.status = "swapped".to_string();
     audit.reason = Some(format!(
-        "classifier swapped with Rust-validated accuracy {rust_acc:.4}"
+        "classifier swapped with Rust-validated accuracy {rust_acc:.4}{}",
+        match audit.current_accuracy {
+            Some(cur) => format!(" (deployed baseline {cur:.4})"),
+            None => " (first swap, no deployed baseline)".to_string(),
+        }
     ));
     tracing::info!(
         "classifier swapped → {} (accuracy {:.4})",
@@ -234,6 +300,16 @@ async fn retrain_inner(cfg: &Config, store: &ModelStore, audit: &mut RetrainAudi
         rust_acc
     );
     let _ = backup;
+
+    // The classes the new model just learned on are consumed: clear the FP
+    // crops so the next nightly starts from fresh false positives instead of
+    // re-learning an overweighted snapshot.
+    let cleared = clear_fp_crops(fp_dir);
+    audit.cleared_fp_crops = Some(cleared);
+    tracing::info!("cleared {cleared} consumed FP crops after retrain swap");
+    if let Err(e) = write_classifier_state(cfg, &out_onnx, rust_acc) {
+        tracing::warn!("cannot persist classifier state: {e:#}");
+    }
 
     prune_stale(&out_onnx);
     Ok(())
@@ -313,6 +389,59 @@ fn discard(onnx: &Path, metrics: &Path) {
     std::fs::remove_file(metrics).ok();
 }
 
+/// Recursively removes the consumed false-positive crops (jpg/jpeg/png) under
+/// `fp_dir`; returns how many files were deleted. Directories and non-image
+/// files are left untouched.
+fn clear_fp_crops(fp_dir: &Path) -> usize {
+    let mut removed = 0usize;
+    let Ok(rd) = std::fs::read_dir(fp_dir) else {
+        return 0;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            removed += clear_fp_crops(&path);
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png") {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Deployed-classifier state, so the A/B baseline survives restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClassifierState {
+    active_onnx: String,
+    accuracy: f64,
+    updated_at: String,
+}
+
+fn classifier_state_path(cfg: &Config) -> PathBuf {
+    cfg.data_dir.join(crate::config::CLASSIFIER_STATE_FILENAME)
+}
+
+fn write_classifier_state(cfg: &Config, active_onnx: &Path, accuracy: f64) -> Result<()> {
+    let st = ClassifierState {
+        active_onnx: active_onnx.to_string_lossy().to_string(),
+        accuracy,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    let json = serde_json::to_string_pretty(&st).context("serialize classifier state")?;
+    std::fs::write(classifier_state_path(cfg), json)
+        .with_context(|| format!("write {}", classifier_state_path(cfg).display()))?;
+    Ok(())
+}
+
+fn read_classifier_state(cfg: &Config) -> Option<ClassifierState> {
+    let path = classifier_state_path(cfg);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 /// Deletes older exported candidates (keeps only the active one plus any
 /// backups already copied elsewhere).
 fn prune_stale(active: &Path) {
@@ -366,4 +495,79 @@ fn sample_images(dir: &Path, limit: usize) -> Vec<PathBuf> {
     all.sort();
     all.truncate(limit);
     all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "av_training_test_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clear_fp_crops_removes_images_only() {
+        let dir = test_dir("clear");
+        std::fs::create_dir_all(dir.join("CAM_001")).unwrap();
+        std::fs::write(dir.join("CAM_001/A.jpg"), b"a").unwrap();
+        std::fs::write(dir.join("CAM_001/b.PNG"), b"b").unwrap();
+        std::fs::write(dir.join("CAM_002.jpeg"), b"c").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"k").unwrap();
+        assert_eq!(clear_fp_crops(&dir), 3);
+        assert!(!dir.join("CAM_001/A.jpg").exists());
+        assert!(!dir.join("CAM_001/b.PNG").exists());
+        assert!(!dir.join("CAM_002.jpeg").exists());
+        assert!(dir.join("keep.txt").exists(), "non-images must survive");
+        assert!(dir.join("CAM_001").is_dir(), "empty subdirs survive");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn classifier_state_roundtrip() {
+        let dir = test_dir("state");
+        let mut cfg = crate::config::Config::test_default();
+        cfg.data_dir = dir.clone();
+        write_classifier_state(&cfg, Path::new("/tmp/classifier_x.onnx"), 0.912).unwrap();
+        let st = read_classifier_state(&cfg).unwrap();
+        assert_eq!(st.active_onnx, "/tmp/classifier_x.onnx");
+        assert_eq!(st.accuracy, 0.912);
+        assert!(read_classifier_state(&crate::config::Config::test_default()).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn audit_serializes_ab_fields() {
+        let audit = RetrainAudit {
+            timestamp: "2026-09-09T00:00:00Z".into(),
+            status: "swapped".into(),
+            reason: Some("ok".into()),
+            real_samples: 10,
+            fp_samples: 20,
+            python_val_accuracy: Some(0.9),
+            python_val_samples: Some(30),
+            python_train_samples: Some(300),
+            epochs_run: Some(5),
+            rust_validation_accuracy: Some(0.91),
+            current_accuracy: Some(0.89),
+            current_onnx: Some("/tmp/old.onnx".into()),
+            cleared_fp_crops: Some(12),
+            min_accuracy: 0.85,
+            candidate_onnx: Some("/tmp/new.onnx".into()),
+            backup_onnx: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&audit).unwrap();
+        assert!(json.contains("\"current_accuracy\""));
+        assert!(json.contains("\"cleared_fp_crops\""));
+        assert!(json.contains("\"current_onnx\""));
+    }
 }

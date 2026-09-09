@@ -7,9 +7,15 @@
 //!     streamed from disk
 //!   - `POST /anonymize/batch`  multiple archives / chunked upload, no body
 //!     limit (spooled to disk, processed in sequence, merged ZIP response)
+//!   - `POST /anonymize/s3`      async S3 ingestion (feature `s3`): accepts an
+//!     `input_key`, downloads from the input bucket, processes, uploads to the
+//!     output bucket, writes an audit log, optionally calls a webhook
+//!   - `GET  /status/:job_id`     async S3 job status (feature `s3`)
 //!   - `GET  /health`
 //!   - `GET  /operator/cameras` operator listing / FSM reset (§4), gated by
 //!     the `X-Operator-Key` header
+//!   - `GET  /operator/gpu`       inference execution-provider status + measured
+//!     per-stage inference statistics, gated the same way
 //!   - `GET  /operator/jobs`      last processed jobs + orphaned STORE outputs
 //!     (reads `DATA_DIR/jobs.jsonl` + the on-disk outputs), gated the same way
 //!
@@ -26,9 +32,13 @@ mod models;
 mod pipeline;
 mod retention;
 mod roi;
+#[cfg(feature = "s3")]
+mod s3_client;
 #[cfg(feature = "retraining")]
 mod training;
 mod zip_worker;
+#[cfg(feature = "s3")]
+mod zip_worker_s3;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,12 +58,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use crate::config::{Config, DetectorMode};
+use crate::config::{Config, DetectorMode, MaskSegmenter};
 use crate::db::{Camera, Db};
-use crate::model_loader::ensure_model;
+use crate::model_loader::{ensure_model, ExecutionSettings};
 use crate::models::{ModelStore, SessionPool};
 use crate::retention::{read_jobs_ledger, record_job, JobLedgerEntry};
-use crate::roi::{extract_roi, RoiOutcome};
+use crate::roi::{extract_roi, RoiOutcome, RoiPolygon};
 use crate::zip_worker::{sanitize_filename, ArchiveEntryError, ZipJobOutcome, ZipProcessor};
 
 const OPERATOR_KEY_HEADER: &str = "x-operator-key";
@@ -66,7 +76,19 @@ struct AppState {
     worker: ZipProcessor,
     /// Global single-job lock: concurrent uploads get HTTP 429 (§2).
     job_lock: Arc<Mutex<()>>,
+    /// S3 worker, present only when `S3_ENABLED=true` **and** built with
+    /// `--features s3`; the `/anonymize/s3` + `/status/:job_id` routes are
+    /// registered exactly then.
+    #[cfg(feature = "s3")]
+    s3: Option<S3ZipWorker>,
 }
+
+#[cfg(feature = "s3")]
+use crate::s3_client::S3Client;
+#[cfg(feature = "s3")]
+use crate::zip_worker_s3::{default_output_key, webhook_host_allowed, S3ZipWorker};
+#[cfg(feature = "s3")]
+use serde::Deserialize;
 
 // ─── Entry point ────────────────────────────────────────────────────────────
 
@@ -116,6 +138,26 @@ async fn run() -> Result<()> {
             .map(|n| n.get())
             .unwrap_or(1),
         cfg.max_concurrent_images
+    );
+
+    // Execution provider for every ONNX session (env `ORT_EXECUTION_PROVIDER`;
+    // fail-fast: a configured GPU that cannot be used aborts startup instead of
+    // silently running on CPU).
+    crate::model_loader::configure_execution(ExecutionSettings {
+        provider: cfg.execution_provider,
+        device_id: cfg.gpu_device_id,
+        gpu_memory_limit_bytes: cfg.gpu_memory_limit_bytes,
+        enable_tf32: cfg.enable_tf32,
+        enable_fp16: cfg.enable_fp16,
+    })
+    .context("configure execution provider")?;
+    tracing::info!(
+        "inference execution provider: {} (device {}, gpu mem limit {:?}, tf32 {}, fp16 {})",
+        cfg.execution_provider.as_str(),
+        cfg.gpu_device_id,
+        cfg.gpu_memory_limit_bytes,
+        cfg.enable_tf32,
+        cfg.enable_fp16
     );
 
     // Storage layout.
@@ -193,9 +235,38 @@ async fn run() -> Result<()> {
         .await
         .context("open SQLite database")?;
 
+    // Optional ACTIVE face-mask segmenter (MediaPipe Selfie, env
+    // `MASK_SEGMENTER=mediapipe`): downloaded/verified like the other models.
+    let segmenter_pool = match cfg.mask_segmenter {
+        MaskSegmenter::Off => None,
+        MaskSegmenter::Mediapipe => {
+            let resolved = ensure_model(
+                &http,
+                &cfg.selfie_segmenter_url,
+                cfg.selfie_segmenter_sha256.as_deref(),
+                &cfg.model_cache_dir,
+            )
+            .await
+            .with_context(|| "face-mask segmenter model resolution failed")?;
+            model_loader::load_session(&resolved.path).with_context(|| {
+                format!(
+                    "face-mask segmenter not loadable: {}",
+                    resolved.path.display()
+                )
+            })?;
+            tracing::info!(
+                "face-mask segmenter ready at {} (downloaded: {})",
+                resolved.path.display(),
+                resolved.downloaded
+            );
+            Some(SessionPool::new(resolved.path, cfg.effective_concurrency()))
+        }
+    };
+
     let store = ModelStore::new(
         SessionPool::new(detector.path.clone(), cfg.effective_concurrency()),
         classifier_pool,
+        segmenter_pool,
     );
 
     // Nightly background job: ROI finalization for expired LEARNING cameras,
@@ -223,11 +294,58 @@ async fn run() -> Result<()> {
         db: db.clone(),
         worker: ZipProcessor::new(cfg.clone(), db, store),
         job_lock: Arc::new(Mutex::new(())),
+        #[cfg(feature = "s3")]
+        s3: None,
+    };
+
+    // S3 backend (feature `s3`, env `S3_ENABLED=true`): instantiate the
+    // client, fail-fast on the three buckets (credentials + endpoint), and
+    // share the SAME ZipProcessor the HTTP flow uses — the per-image
+    // semaphore and session pool are not duplicated.
+    #[cfg(feature = "s3")]
+    let state = {
+        let mut state = state;
+        if let Some(settings) = state.cfg.s3.as_ref() {
+            let s3_client = S3Client::from_settings(settings)
+                .await
+                .context("S3 client initialization")?;
+            s3_client
+                .check_bucket(&settings.bucket_input)
+                .await
+                .context("S3 input bucket check")?;
+            s3_client
+                .check_bucket(&settings.bucket_output)
+                .await
+                .context("S3 output bucket check")?;
+            s3_client
+                .check_bucket(&settings.bucket_logs)
+                .await
+                .context("S3 logs bucket check")?;
+            let webhook_state = if settings.webhook_allowed_hosts.is_empty() {
+                "disabled".to_string()
+            } else {
+                settings.webhook_allowed_hosts.join(",")
+            };
+            tracing::info!(
+                "S3 backend ready: input={} output={} logs={} (jobs ≤ {}, webhooks {})",
+                settings.bucket_input,
+                settings.bucket_output,
+                settings.bucket_logs,
+                settings.max_concurrent_jobs,
+                webhook_state
+            );
+            state.s3 = Some(S3ZipWorker::new(
+                state.worker.clone(),
+                s3_client,
+                std::sync::Arc::new(settings.clone()),
+            ));
+        }
+        state
     };
 
     let body_limit = state.cfg.body_limit_bytes;
     let bind_addr = state.cfg.bind_addr.clone();
-    let app = Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         // /anonymize: single archive, bounded by BODY_LIMIT_BYTES.
         .route(
@@ -244,9 +362,22 @@ async fn run() -> Result<()> {
         .route("/operator/cameras", get(op_cameras))
         .route("/operator/cameras/:id", get(op_camera))
         .route("/operator/cameras/:id/reset", post(op_reset))
+        .route("/operator/cameras/:id/roi", post(op_set_roi))
         .route("/operator/retrain-audit", get(op_retrain_audit))
-        .route("/operator/jobs", get(op_jobs))
-        .with_state(state);
+        .route("/operator/gpu", get(op_gpu))
+        .route("/operator/jobs", get(op_jobs));
+
+    #[cfg(feature = "s3")]
+    let router = if state.s3.is_some() {
+        router
+            .route("/anonymize/s3", post(anonymize_s3))
+            .route("/status/:job_id", get(status_s3))
+            .route("/operator/s3/sweep", post(op_s3_sweep))
+    } else {
+        router
+    };
+
+    let app = router.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -261,6 +392,186 @@ async fn run() -> Result<()> {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+// ─── S3 async ingestion (feature `s3`, spec §8 "Scenario S3") ────────────────
+
+/// `POST /anonymize/s3` — validates the request, checks the input object
+/// exists, and queues an asynchronous job (the response only accepts it; the
+/// completion signal is `/status/:job_id` polling or the optional webhook).
+#[cfg(feature = "s3")]
+#[derive(Debug, Deserialize)]
+struct S3AnonymizeRequest {
+    /// Object key of the archive in the input bucket (`.zip`/`.7z`/`.rar`).
+    input_key: String,
+    /// Optional destination key in the output bucket; defaults to
+    /// `elaborati/<input>_elaborato.zip`.
+    output_key: Option<String>,
+    /// Optional completion webhook; the host must be on
+    /// `S3_WEBHOOK_ALLOWED_HOSTS` (anti-SSRF guard).
+    callback_url: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+async fn anonymize_s3(
+    State(state): State<AppState>,
+    Json(payload): Json<S3AnonymizeRequest>,
+) -> Response {
+    let Some(worker) = state.s3.as_ref() else {
+        // Route is registered only when S3_ENABLED=true; defense in depth.
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "S3 backend is disabled (S3_ENABLED=false or build without --features s3)",
+        );
+    };
+
+    let input_key = payload.input_key.trim().to_string();
+    if input_key.is_empty() || input_key.starts_with('/') {
+        return json_err(StatusCode::BAD_REQUEST, "input_key must be a non-empty object key");
+    }
+    let output_key = match payload.output_key.as_deref() {
+        Some(k) => {
+            let k = k.trim().to_string();
+            if k.is_empty() || k.starts_with('/') {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "output_key must be a non-empty object key",
+                );
+            }
+            k
+        }
+        None => default_output_key(&input_key),
+    };
+
+    // Webhook guard: allowlist (host[:port]) or 400 at submit time — never
+    // contact an arbitrary endpoint from the job task.
+    if let Some(url) = payload.callback_url.as_deref() {
+        if !webhook_host_allowed(&worker.settings, url) {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "callback_url {url} is not on the S3_WEBHOOK_ALLOWED_HOSTS allowlist \
+                     (set the env var to enable webhooks)"
+                ),
+            );
+        }
+    }
+
+    // Fail-fast existence check on the input object.
+    match worker.s3.object_exists(&worker.s3.bucket_input, &input_key).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_err(
+                StatusCode::NOT_FOUND,
+                format!("s3://{}/{} not found", worker.s3.bucket_input, input_key),
+            );
+        }
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("S3 check failed: {e}")),
+    }
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    worker
+        .tracker
+        .submit(job_id.clone(), input_key.clone(), output_key.clone())
+        .await;
+
+    let input = format!("s3://{}/{}", worker.s3.bucket_input, input_key);
+    let output = format!("s3://{}/{}", worker.s3.bucket_output, output_key);
+
+    let job_worker = worker.clone();
+    let callback_url = payload.callback_url.clone();
+    let job = (job_id.clone(), input_key.clone(), output_key.clone());
+    tokio::spawn(async move {
+        let (jid, ik, ok) = job;
+        let _ = job_worker
+            .run_job(
+                &jid,
+                &ik,
+                &ok,
+                callback_url.as_deref(),
+                crate::zip_worker_s3::S3JobPolicy {
+                    delete_input_on_success: false,
+                },
+            )
+            .await;
+    });
+
+    Json(serde_json::json!({
+        "status": "accepted",
+        "job_id": job_id,
+        "input": input,
+        "output": output,
+        "check_status_at": format!("/status/{job_id}"),
+    }))
+    .into_response()
+}
+
+/// `GET /status/:job_id` — in-memory async S3 job status.
+#[cfg(feature = "s3")]
+async fn status_s3(State(state): State<AppState>, Path(job_id): Path<String>) -> Response {
+    let Some(worker) = state.s3.as_ref() else {
+        return json_err(StatusCode::NOT_FOUND, "S3 backend is disabled");
+    };
+    match worker.tracker.get(&job_id).await {
+        Some(status) => Json(status).into_response(),
+        None => json_err(StatusCode::NOT_FOUND, format!("job {job_id} not found")),
+    }
+}
+
+/// `POST /operator/s3/sweep` — operator batch sweep (feature `s3`): lists the
+/// input bucket under an optional prefix and submits every eligible archive
+/// (`.zip`/`.7z`/`.rar`, not already under `errori/`) as a tracked background
+/// job. Jobs run through the shared S3 semaphore, so concurrency stays bounded
+/// even for a large sweep.
+#[cfg(feature = "s3")]
+#[derive(Debug, Deserialize)]
+struct S3SweepRequest {
+    #[serde(default)]
+    prefix: String,
+    /// Max objects to list (default 50, clamped 1..=500).
+    #[serde(default = "default_sweep_max_files")]
+    max_files: usize,
+    /// Delete the input object after a successful processing (default true).
+    #[serde(default = "default_sweep_delete")]
+    delete_input_on_success: bool,
+}
+
+#[cfg(feature = "s3")]
+fn default_sweep_max_files() -> usize {
+    50
+}
+
+#[cfg(feature = "s3")]
+fn default_sweep_delete() -> bool {
+    true
+}
+
+#[cfg(feature = "s3")]
+async fn op_s3_sweep(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<S3SweepRequest>,
+) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    let Some(worker) = state.s3.as_ref() else {
+        return json_err(StatusCode::NOT_FOUND, "S3 backend is disabled");
+    };
+    let prefix = payload.prefix.trim().trim_start_matches('/').to_string();
+    let max_files = payload.max_files.clamp(1, 500);
+    match worker
+        .submit_batch(&prefix, max_files, payload.delete_input_on_success)
+        .await
+    {
+        Ok(jobs) => Json(serde_json::json!({
+            "status": "accepted",
+            "submitted": jobs.len(),
+            "jobs": jobs,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
 }
 
 /// `POST /anonymize` — single-job archive ingestion (§2: .zip/.7z/.rar).
@@ -659,6 +970,61 @@ async fn op_retrain_audit(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 }
 
+/// `GET /operator/gpu` — current inference execution-provider configuration
+/// plus measured per-stage inference statistics (`inference.*.count` /
+/// `avg_ms`, process-lifetime over every processed image). `device_name` is a
+/// best-effort `nvidia-smi` query (cached 60 s); it is `null` when the query
+/// fails (no NVIDIA driver / CPU-only host).
+async fn op_gpu(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    let mut inference = serde_json::Map::new();
+    for (stage, count, avg_ms) in crate::models::inference_stats() {
+        inference.insert(
+            stage.to_string(),
+            serde_json::json!({ "count": count, "avg_ms": avg_ms }),
+        );
+    }
+    Json(serde_json::json!({
+        "execution_provider": state.cfg.execution_provider.as_str(),
+        "device_id": state.cfg.gpu_device_id,
+        "gpu_memory_limit_bytes": state.cfg.gpu_memory_limit_bytes,
+        "enable_tf32": state.cfg.enable_tf32,
+        "enable_fp16": state.cfg.enable_fp16,
+        "device_name": gpu_device_name(),
+        "inference": inference,
+    }))
+    .into_response()
+}
+
+/// Best-effort GPU device name via `nvidia-smi`, cached for 60 seconds.
+/// Returns `None` (no UTF-8 output, no driver, missing binary) and never
+/// blocks the request for long — this is purely informational.
+fn gpu_device_name() -> Option<String> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
+    if let Ok(mut cache) = CACHE.lock() {
+        if let Some((at, name)) = cache.as_ref() {
+            if at.elapsed() < Duration::from_secs(60) {
+                return Some(name.clone());
+            }
+        }
+        let name = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=name", "--format=csv,noheader,noenv"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(name) = name.clone() {
+            *cache = Some((std::time::Instant::now(), name));
+        }
+        return name;
+    }
+    None
+}
+
 /// `GET /operator/jobs` — the most recent processed jobs, read from the
 /// `DATA_DIR/jobs.jsonl` ledger written by the `/anonymize` handlers, plus
 /// any orphan `*_elaborato.zip` outputs still on disk. Query param `limit`
@@ -820,18 +1186,84 @@ struct ResetRequest {
     target_state: String,
 }
 
+/// Body of `POST /operator/cameras/:id/roi`: `{"type": "full"}` sets the
+/// whole frame as the anonymization zone and activates the camera (bypasses
+/// the extractor's area cap — for wide-angle / narrow-framed scenes where the
+/// street fills the whole frame).
+#[derive(Debug, serde::Deserialize)]
+struct RoiRequest {
+    r#type: String,
+}
+
+/// `POST /operator/cameras/:id/roi` — set a camera ROI without re-learning.
+async fn op_set_roi(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<RoiRequest>,
+) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    let cam = match state.db.camera_by_id(&id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return json_err(StatusCode::NOT_FOUND, format!("camera {id} not found")),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")),
+    };
+    match body.r#type.as_str() {
+        "full" => {
+            let (Some(w), Some(h)) = (cam.frame_width, cam.frame_height) else {
+                return json_err(
+                    StatusCode::CONFLICT,
+                    "camera has no frame geometry yet — upload a frame first",
+                );
+            };
+            if w == 0 || h == 0 {
+                return json_err(
+                    StatusCode::CONFLICT,
+                    "camera has no frame geometry yet — upload a frame first",
+                );
+            }
+            let roi = crate::roi::RoiPolygon {
+                polygon: vec![
+                    [0.0, 0.0],
+                    [w as f64 - 1.0, 0.0],
+                    [w as f64 - 1.0, h as f64 - 1.0],
+                    [0.0, h as f64 - 1.0],
+                ],
+                image_width: w,
+                image_height: h,
+                area_ratio: 1.0,
+            };
+            if let Err(e) = state.db.set_roi_and_activate(&id, &roi.to_json()).await {
+                return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"));
+            }
+            tracing::info!("operator set full-frame ROI for camera {id}");
+            json_err(
+                StatusCode::OK,
+                format!("camera {id} ROI set to full frame and camera ACTIVE"),
+            )
+        }
+        other => json_err(
+            StatusCode::BAD_REQUEST,
+            format!("roi type must be 'full', got '{other}'"),
+        ),
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn json_err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
 
-/// Nightly scheduler (§5 ROI finalization, §6 retraining). Also runs a
-/// catch-up ROI pass at startup so cameras whose LEARNING window expired while
-/// the service was down still transition promptly.
+/// Nightly scheduler (§5 ROI finalization + dynamic ROI, §6 retraining). Also
+/// runs a catch-up pass at startup so cameras whose LEARNING window expired
+/// while the service was down still transition promptly.
 async fn background_loop(cfg: Arc<Config>, db: Db, store: ModelStore) {
     tracing::info!("background scheduler started");
     finalize_expired_rois(&cfg, &db).await;
+    reextract_active_rois(&cfg, &db).await;
 
     loop {
         let wait = cfg
@@ -841,6 +1273,8 @@ async fn background_loop(cfg: Arc<Config>, db: Db, store: ModelStore) {
         tokio::time::sleep(wait).await;
         tracing::info!("nightly run starting");
         finalize_expired_rois(&cfg, &db).await;
+        reextract_active_rois(&cfg, &db).await;
+        prune_old_detections(&cfg, &db).await;
         #[cfg(feature = "retraining")]
         {
             if let Err(e) = training::nightly_retrain(&cfg, &store).await {
@@ -939,5 +1373,115 @@ async fn finalize_one_roi(cfg: &Config, db: &Db, cam: &Camera) {
                  keeping camera in LEARNING"
             );
         }
+    }
+}
+
+/// Dynamic ROI (ACTIVE cameras): re-extract the polygon every nightly pass
+/// from the anonymized detections of the last `ROI_REEXTRACT_WINDOW_DAYS`,
+/// adopting the candidate only when the stability guard approves
+/// (`ROI_REEXTRACT_MIN_IOU` or a frame-geometry change). ACTIVE proto-ROIs
+/// that cannot be re-extracted (no data / invalid) keep their deployed one.
+async fn reextract_active_rois(cfg: &Config, db: &Db) {
+    if !cfg.roi_reextract_enabled {
+        return;
+    }
+    let Ok(cameras) = db.all_cameras().await else {
+        tracing::warn!("dynamic ROI: cannot read cameras");
+        return;
+    };
+    for cam in cameras {
+        if cam.state != crate::db::CameraState::Active {
+            continue;
+        }
+        reextract_one_roi(cfg, db, &cam).await;
+    }
+}
+
+async fn reextract_one_roi(cfg: &Config, db: &Db, cam: &Camera) {
+    let cam_id = &cam.id;
+    let (Some(w), Some(h)) = (cam.frame_width, cam.frame_height) else {
+        return;
+    };
+    let since = Utc::now() - ChronoDuration::days(cfg.roi_reextract_window_days as i64);
+    let points = match db.detections_for_camera_since(cam_id, &since).await {
+        Ok(p) => p
+            .into_iter()
+            .map(|(x, y)| (x as f64, y as f64))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::error!("camera {cam_id}: dynamic ROI — cannot read detections: {e}");
+            return;
+        }
+    };
+
+    let candidate = match extract_roi(
+        &points,
+        w,
+        h,
+        cfg.roi_eps_px,
+        cfg.roi_min_samples,
+        cfg.roi_rdp_epsilon,
+        cfg.roi_area_min,
+        cfg.roi_area_max,
+        cfg.roi_margin_pct,
+    ) {
+        RoiOutcome::Polygon(roi) => roi,
+        RoiOutcome::Invalid(reason) => {
+            tracing::debug!("camera {cam_id}: dynamic ROI candidate invalid ({reason}) — keep deployed");
+            return;
+        }
+        RoiOutcome::InsufficientData => {
+            tracing::debug!("camera {cam_id}: dynamic ROI — not enough fresh detections — keep deployed");
+            return;
+        }
+    };
+
+    let current = cam.roi_json.as_deref().and_then(RoiPolygon::from_json);
+    match crate::roi::decide_roi(current.as_ref(), &candidate, cfg.roi_reextract_min_iou) {
+        crate::roi::RoiDecision::KeepStable { iou } => {
+            tracing::info!(
+                "camera {cam_id}: dynamic ROI kept (IoU {iou:.3} ≥ {})",
+                cfg.roi_reextract_min_iou
+            );
+        }
+        crate::roi::RoiDecision::Replace => {
+            tracing::info!(
+                "camera {cam_id}: dynamic ROI replaced ({:.1}% of frame, {} vertices)",
+                candidate.area_ratio * 100.0,
+                candidate.polygon.len()
+            );
+            if let Err(e) = db.set_roi_and_activate(cam_id, &candidate.to_json()).await {
+                tracing::error!("camera {cam_id}: dynamic ROI — cannot persist: {e}");
+            }
+        }
+        crate::roi::RoiDecision::GeometryChanged => {
+            let (ow, oh) = current
+                .map(|c| (c.image_width, c.image_height))
+                .unwrap_or((0, 0));
+            tracing::info!(
+                "camera {cam_id}: dynamic ROI re-adopted after frame geometry change \
+                 ({ow}×{oh} → {}×{})",
+                candidate.image_width,
+                candidate.image_height
+            );
+            if let Err(e) = db.set_roi_and_activate(cam_id, &candidate.to_json()).await {
+                tracing::error!("camera {cam_id}: dynamic ROI — cannot persist: {e}");
+            }
+        }
+    }
+}
+
+/// Bounds the detections table: keeps the horizon needed by both the LEARNING
+/// finalization (full `LEARNING_DAYS` history) and the dynamic-ROI window.
+async fn prune_old_detections(cfg: &Config, db: &Db) {
+    let horizon_days = cfg.learning_days.max(cfg.roi_reextract_window_days) as i64 + 1;
+    let cutoff = Utc::now() - ChronoDuration::days(horizon_days);
+    match db.prune_detections_older_than(&cutoff).await {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!("pruned {removed} stale detections (horizon {horizon_days}d)");
+            }
+        }
+        Err(e) => tracing::warn!("cannot prune stale detections: {e}"),
     }
 }

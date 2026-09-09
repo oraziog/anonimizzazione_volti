@@ -90,6 +90,23 @@ docker compose up -d --build
 The image build enables the `retraining` cargo feature (PyO3, Python 3.11) and
 installs CPU PyTorch; set a real `OPERATOR_API_KEY` in `.env` first.
 
+### GPU (NVIDIA CUDA) via Docker
+
+A separate image compiles the binary with the `cuda` cargo feature (ort's
+`download-binaries` then fetches a **CUDA 13 + cuDNN 9** ONNX Runtime) and
+deploys on the GUI driver stack:
+
+```bash
+docker compose -f docker-compose.gpu.yml up -d --build
+```
+
+Set `ORT_EXECUTION_PROVIDER=cuda` in `.env` (the compose file defaults it
+too), calibrate `ORT_CUDA_DEVICE_ID` / `ORT_CUDA_MEMORY_LIMIT_BYTES`, and
+make sure the `nvidia/cuda:*` base tag in `Dockerfile.gpu` matches the host
+driver (verify inside the container with `ldd` and `nvidia-smi`). Local
+Windows builds with a GPU feature also work (`cargo build --features cuda`)
+but the process needs the same CUDA/cuDNN runtime DLLs at execution time.
+
 ### Retraining build requirements
 
 `cargo build` uses no default features, so a plain toolchain suffices. To build
@@ -190,8 +207,19 @@ curl -H "X-Operator-Key: $KEY" -X POST \
 #   INITIAL  → zeroes the ROI and restarts the learning cycle
 #   LEARNING → keeps the production ROI but reopens data collection
 
+# Force the whole frame as anonymization ROI (wide-angle scenes where the
+# street fills the frame and the extractor's area cap would reject it):
+curl -H "X-Operator-Key: $KEY" -X POST \
+     -H "Content-Type: application/json" \
+     -d '{"type":"full"}' \
+     http://localhost:8080/operator/cameras/CAM_001/roi
+
 # Last nightly-retraining audit record (JSON, written by the retraining job):
 curl -H "X-Operator-Key: $KEY" http://localhost:8080/operator/retrain-audit
+
+# Inference backend status: configured EP, device id, memory limit, TF32/FP16
+# flags, measured per-stage inference stats and best-effort nvidia-smi name:
+curl -H "X-Operator-Key: $KEY" http://localhost:8080/operator/gpu
 
 # Last processed jobs (reads DATA_DIR/jobs.jsonl + the on-disk outputs):
 # archive, images, errors, output size, timestamps; orphan *_elaborato.zip
@@ -204,6 +232,60 @@ The audit JSON contains `status` (`swapped` / `rejected` / `skipped` /
 the candidate/backup ONNX paths — so operators can see *why* a candidate was
 accepted or discarded.
 
+### S3 storage backend (spec §8 "Scenario S3", feature `s3`)
+
+Asynchronous ingest from an S3-compatible bucket (MinIO, AWS, Spaces…). It is
+an **opt-in compile-time feature** (`cargo build --features s3`, or the
+Docker build arg `FEATURES=retraining,s3`). Without it the routes below do
+not exist; with `S3_ENABLED` unset/false the service starts but skips the S3
+backend entirely.
+
+Quick start with MinIO (creates the service + 3 private buckets):
+
+```bash
+docker compose -f docker-compose.minio.yml up -d --build
+./scripts/s3_tools.sh upload frame.zip camera_001.zip          # -> s3://anonimizzazione-input/camera_001.zip
+curl -X POST localhost:8080/anonymize/s3 \
+     -H 'Content-Type: application/json' \
+     -d '{"input_key":"camera_001.zip"}'
+curl localhost:8080/status/:JOB_ID                             # queued/running/done/failed
+```
+
+Flow per job: the worker downloads the archive from the input bucket to a
+scratch dir under `DATA_DIR`, processes it with the **same** `ZipProcessor`
+as the HTTP path (per-image `MAX_CONCURRENT_IMAGES` still applies), uploads
+`elaborati/<stem>_elaborato.zip` to the output bucket, writes a JSON audit
+log to the logs bucket (`logs/<job_id>.json`) and — if an allowlisted
+completion host is configured — POSTs a webhook carrying the job id, output
+key and a 1 h **presigned GET URL**. On failure the input archive is moved to
+`errori/<key>` (parking it, so a sweep never re-picks it).
+
+Endpoints (registered only when the backend is enabled):
+
+- `POST /anonymize/s3` — body `{"input_key":"...", "output_key":"...?", "callback_url":"...?"}`.
+  Enforces the webhook anti-SSRF allowlist (400 if the callback host is not
+  listed), `404` if the input object does not exist, `202 Accepted` otherwise
+  with `job_id`, `input`, `output` and `check_status_at`. The input object is
+  **not** deleted (delete policy is only enabled on the operator sweep).
+- `GET /status/:job_id` — in-memory job state and progress counters.
+- `POST /operator/s3/sweep` (gated by `X-Operator-Key`) — batch backfill:
+  body `{"prefix":"", "max_files":50, "delete_input_on_success":true}` lists
+  the input bucket and submits every `.zip`/`.7z`/`.rar` not under `errori/`
+  as a tracked job (metadata per submitted object is echoed back). Real
+  parallelism stays bounded by `S3_MAX_CONCURRENT_JOBS`.
+
+Config (see `.env.example`): `S3_ENABLED`, `S3_ENDPOINT` (empty → real AWS,
+virtual-hosted; set → path-style by default), `S3_FORCE_PATH_STYLE`,
+`S3_BUCKET_INPUT/OUTPUT/LOGS`, `S3_MAX_CONCURRENT_JOBS` (default 2),
+`S3_WEBHOOK_ALLOWED_HOSTS`. Storage credentials come from the standard AWS
+chain: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
+
+> **Security notes.** Buckets are private (no anonymous `mc policy set public`
+> in the shipped compose file). Completion webhooks are disabled unless
+> `S3_WEBHOOK_ALLOWED_HOSTS` names the host — never allow arbitrary webhook
+> callbacks from the internet. Job state is in memory: after a restart the
+> durable trace is the audit log in the logs bucket.
+
 ## Configuration
 
 Every knob lives in env vars — see `.env.example` for the full annotated list.
@@ -213,15 +295,47 @@ Key groups:
   classifier), `MODEL_CACHE_DIR`, `MODEL_*_SHA256` integrity checks.
 - **Pipeline** — `YOLO_CONF_THRESHOLD`, `YOLO_NMS_IOU`,
   `FP_CROP_CONF_MAX`, `INITIAL_BLUR_SIGMA`, `BLUR_HULL_MARGIN_PCT`,
-  `JPEG_QUALITY`.
+  `JPEG_QUALITY`, `SEGMENTER_MIN_BOX`, `OUTPUT_FORMAT`, `OUTPUT_MAX_SIDE`.
 - **FSM/ROI** — `LEARNING_DAYS`, `ROI_EPS_PX`, `ROI_MIN_SAMPLES`,
   `ROI_RDP_EPSILON`, `ROI_AREA_MIN`, `ROI_AREA_MAX`, `ROI_MARGIN_PCT`.
+  **Dynamic ROI (ACTIVE)**: ogni passaggio notturno ri-estrae il poligono
+  dalle rilevazioni anonimizzate degli ultimi `ROI_REEXTRACT_WINDOW_DAYS` e
+  lo sostituisce solo se è diverso da quello attivo oltre `ROI_REEXTRACT_MIN_IOU`
+  (guardia di stabilità contro fluttuazioni PTZ/scena). Un cambio di geometria
+  del frame viene sempre adottato; `ROI_REEXTRACT_ENABLED=false` congela la
+  ROI al momento dell'ACTIVE (comportamento storico). Le detection della
+  tabella vengono potate oltre `max(LEARNING_DAYS, window)+1` giorni.
 - **Retraining** — `CRON_RETRAIN_SCHEDULE` (HH:MM local),
-  `RETRAIN_MIN_ACCURACY`, `RETRAIN_HOLDOUT_FRACTION`, `RETRAIN_EPOCHS`,
-  `RETRAIN_BATCH_SIZE`, `RETRAIN_SCRIPT_PATH`.
+  `RETRAIN_MIN_ACCURACY`, `RETRAIN_REGRESSION_EPS` (A/B), `RETRAIN_HOLDOUT_FRACTION`,
+  `RETRAIN_EPOCHS`, `RETRAIN_BATCH_SIZE`, `RETRAIN_SCRIPT_PATH`.
+  A nightly candidate is swapped **only if** it passes `RETRAIN_MIN_ACCURACY`
+  and does not degrade the deployed model on the same deterministic holdout:
+  `candidate ≥ current − RETRAIN_REGRESSION_EPS` (default 0). On a successful
+  swap the consumed `dataset_falsi_positivi` crops are cleared (the new model
+  already learned on them) and the live model + accuracy are persisted in
+  `DATA_DIR/classifier_state.json`, surfaced in `/operator/retrain-audit`.
+- **Inference backend (GPU)** — `ORT_EXECUTION_PROVIDER` (`cpu` default |
+  `cuda` | `tensorrt` | `directml`), `ORT_CUDA_DEVICE_ID`,
+  `ORT_CUDA_MEMORY_LIMIT_BYTES` (per-session device arena / TensorRT
+  workspace), `ORT_ENABLE_TF32` (CUDA, Ampere+), `ORT_ENABLE_FP16`
+  (TensorRT only). The GPU providers require the binary **compiled** with the
+  matching cargo feature (`cuda` / `tensorrt` / `directml` — `Dockerfile.gpu`
+  builds `--features retraining,cuda`) and, at runtime, the NVIDIA stack the
+  prebuilt ONNX Runtime expects (CUDA 13 + cuDNN 9; see `Dockerfile.gpu`).
+  Configured-GPU-unusable is **fail-fast at startup**, never a silent CPU
+  fallback. `GET /operator/gpu` reports the active provider, the per-stage
+  measured inference counters (`detector` / `classifier` / `segmenter`:
+  `count` + `avg_ms`) and a best-effort `nvidia-smi` device name.
 - **Ops** — `MAX_CONCURRENT_IMAGES` (default: auto-detected — cores ≤ 4 →
   all cores, cores > 4 → cores − 2; override only to tune),
   `BODY_LIMIT_BYTES`, `DATA_DIR`, `OPERATOR_API_KEY`.
+- **S3 backend** — `S3_ENABLED`, `S3_ENDPOINT` (vuoto → AWS reale; impostato →
+  addressing path-style di default), `S3_FORCE_PATH_STYLE`,
+  `S3_BUCKET_INPUT/OUTPUT/LOGS`, `S3_MAX_CONCURRENT_JOBS` (2 default),
+  `S3_WEBHOOK_ALLOWED_HOSTS` (allowlist anti-SSRF; vuoto → webhook disabilitati).
+  Credenziali dal chain `AWS_*`. Richiede il binario compilato con la feature
+  `s3` (`Dockerfile`: build arg `FEATURES=retraining,s3`). Vedere
+  "S3 storage backend" sopra.
 - **Retention (STORE outputs)** — the anonymized `<input>_elaborato.zip`
   files accumulating in `DATA_DIR` are pruned by a background loop:
   `RETENTION_MAX_DAYS` (age rule), `RETENTION_MAX_GB` (size rule, oldest
@@ -330,6 +444,68 @@ default keeps only `easy` + `medium` faces (tiny/blurry `hard` crops would
 poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
 `--margin`/`--min-side`/`--max-crops` control the crop geometry and budget.
 
+## Troubleshooting e dove agire sui parametri
+
+### Dove guardare quando qualcosa non torna
+
+- **Log** — sul Docker: `docker logs -f <container>`; localmente lo stdout del
+  processo. `RUST_LOG=info` (default) mostra il progresso per-immagine
+  (`target: perf` con i tempi decode/detect/encode), `RUST_LOG=debug` aggiunge
+  i dettagli di rete e DB. Il branching della FSM appare come
+  `camera CAM_xxx … INITIAL|LEARNING|ACTIVE`.
+- **Un'immagine mancante dall'output** — ogni file non elaborabile è contato,
+  loggato e riportato sia nell'header `X-Processing-Errors[-Detail]` della
+  risposta sia nel file `<input>_error.txt` dentro l'archivio (col nome
+  dell'entry originale). Un'immagine non decodificabile o con inferenza
+  fallita **non viene mai emessa senza anonimizzazione**: degrada al blur
+  full-frame INITIAL.
+- **Perché una telecamera è ancora LEARNING/INITIAL?** — `GET
+  /operator/cameras` mostra stato, ROI e geometria per tutte. La transizione
+  LEARNING→ACTIVE avviene al primo job notturno dopo `LEARNING_DAYS` con abbastanza
+  rilevamenti (`ROI_MIN_SAMPLES`); se non arriva, aumentate `ROI_MIN_SAMPLES`
+  o controllate che la camera riceva frame in una zona stabile.
+- **Il retraining non sostituisce il modello** — dal `GET /operator/retrain-audit`
+  leggete `status` e `reason`: `skipped` = non abbastanza campioni, `rejected` =
+  accuratezza sotto soglia (campo `rust_validation_accuracy` vs `min_accuracy`),
+  oppure degradazione vs `current_accuracy` (gate A/B). Un modello peggiore
+  viene **sempre scartato**; il precedente resta attivo e il backup resta in
+  `MODELS_BACKUP_DIR`.
+
+### Sintomo → parametro
+
+| Sintomo | Parametro consigliato |
+|---|---|
+| Troppi volti NON anonimizzati in ACTIVE | abbassare `YOLO_CONF_THRESHOLD_ACTIVE` (default 0.05); con `CLASSIFIER_MODEL_URL` vuoto ogni detection in ROI è comunque blurrata (fail-safe) |
+| Troppo "sfocato" il bordo viso | aumentare `BLUR_HULL_MARGIN_PCT` (dilatazione dell'hull) o passare a `MASK_SEGMENTER=mediapipe` |
+| Output troppo grandi / lenti | `JPEG_QUALITY=80–85`, `OUTPUT_MAX_SIDE=<px>` (downscale post-anonimizzazione) |
+| Utente vuole formato uniforme | `OUTPUT_FORMAT=keep|jpeg|png` (rinomina anche le estensioni in uscita) |
+| Angolo estremamente ampio (la strada riempie il frame) | `POST /operator/cameras/:id/roi {"type":"full"}` oppure `ROI_AREA_MAX=1.0` |
+| Maschere lente su scene affollate in ACTIVE | `SEGMENTER_MIN_BOX=64` (volti piccoli → hull geometrico, ~50% di budget risparmiato, p99 −80%) |
+| Falso positivo che torna ripetutamente | resettare a LEARNING (`POST /operator/cameras/:id/reset`) per raccogliere nuovi crop FP e farli validare dal retraining |
+| FSM non evolve mai | `LEARNING_DAYS` troppo alto o `ROI_MIN_SAMPLES` mai soddisfatto; `ROI_AREA_MIN/MAX` troppo restrittivi per la scena |
+
+### Note operative (produzione)
+
+- **Config**: nessuna UI, solo env vars (`.env` in Docker via `env_file`);
+  localmente il binario **non** legge `.env` — settate le variabili nello
+  script che lo avvia.
+- **Retention**: gli `<input>_elaborato.zip` in `DATA_DIR` sono potati dal loop
+  `RETENTION_*` (età e/o dimensione); con volumi alti tenete `RETENTION_MAX_DAYS`
+  e `RETENTION_MAX_GB` attivi.
+- **Diritti**: il container deve scrivere `DATA_DIR`, `dataset_falsi_positivi`,
+  `dataset_seed`, `MODELS_BACKUP_DIR` e la cache dei modelli; se legge i modelli
+  da percorso di sola lettura, serve il `MODEL_CACHE_DIR` sulla cache scaricata.
+- **Windows**: `anonimizzazione_volti.exe` senza la feature `retraining`
+  (richiede Python nel container); per il retraining usate il Dockerfile.
+- **GPU**: il provider si sceglie a build **e** runtime. Binario CPU +
+  `ORT_EXECUTION_PROVIDER=cuda` → l'avvio fallisce subito (feature assente);
+  feature GPU compilata ma driver/CUDA mancanti → l'avvio fallisce subito in
+  `load_session` (provider registrato ma non utilizzabile). Il comportamento
+  è fail-fast per non far partire il servizio "silenziosamente più lento".
+  Monitorate `GET /operator/gpu` (count + `avg_ms` per stage) e con più
+  rendez-vous di sessioni su GPU vincolate l'arena con
+  `ORT_CUDA_MEMORY_LIMIT_BYTES`.
+
 ## Spec open points — status
 
 1. **Seed dataset** — external (mounted at `dataset_seed/real_faces`); the
@@ -342,6 +518,12 @@ poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
 3. **Operator auth** — API key via `X-Operator-Key` header.
 4. **Formats** — JPEG/PNG only; everything else is a counted, logged skip.
 5. **Concurrent uploads** — global job lock, `HTTP 429 Too Many Requests`.
+6. **S3 storage backend** — implemented behind the `s3` cargo feature
+   (see "S3 backend" section above): async job intake from a bucket, output
+   to a bucket, audit logs, presigned download URLs, allowlisted completion
+   webhooks, operator batch sweep. Job status in memory; the durable trace is
+   the audit log object. Not enabled by default (compile-time feature, like
+   `retraining`/`cuda`).
 
 ## Layout note
 

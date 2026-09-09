@@ -6,12 +6,14 @@
 //! crop extraction; ACTIVE → ROI gate + optional classifier + polygon/ellipse
 //! masked blur.
 
-use anyhow::Result;
-use image::{DynamicImage, Rgba};
+use anyhow::{anyhow, Result};
+use image::{DynamicImage, Luma, Rgba};
 
-use crate::config::{AnonMode, Config};
+use crate::config::{AnonMode, Config, MaskSegmenter};
 use crate::db::CameraState;
-use crate::models::{run_classifier, run_detector, FaceDetection, Keypoints, ModelStore, Rect};
+use crate::models::{
+    run_classifier, run_detector, run_selfie_segmenter, FaceDetection, Keypoints, ModelStore, Rect,
+};
 use crate::roi::RoiPolygon;
 
 /// Which FSM branch processed the image (used for logging/metrics).
@@ -20,6 +22,17 @@ pub enum Branch {
     Initial,
     Learning,
     Active,
+}
+
+impl Branch {
+    #[cfg(feature = "s3")]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Branch::Initial => "initial",
+            Branch::Learning => "learning",
+            Branch::Active => "active",
+        }
+    }
 }
 
 /// The anonymization operation configured for this service (env `ANON_MODE`):
@@ -73,7 +86,9 @@ impl AnonOp {
 pub struct ProcessOutcome {
     pub branch: Branch,
     pub detections: Vec<FaceDetection>,
-    /// Detection centers to persist during LEARNING.
+    /// Detection centers to persist during LEARNING (background collection)
+    /// and ACTIVE (fresh data for the scheduled ROI re-extraction): for ACTIVE
+    /// only the actually-anonymized detections are recorded.
     pub record_detections: bool,
     /// Crops to save as false-positive candidates (LEARNING).
     pub fp_crops: Vec<(u32, u32, DynamicImage)>,
@@ -166,38 +181,65 @@ fn box_blur_region(img: &mut image::RgbaImage, region: Rect, radius: i64) {
     }
 }
 
+/// Bounding box of the non-zero mask pixels. Returns `(x, y, w, h)` or
+/// `(0, 0, 0, 0)` when the mask is empty (nothing to do).
+fn mask_bbox(mask: &image::GrayImage) -> (u32, u32, u32, u32) {
+    let (w, h) = mask.dimensions();
+    let mut min = (w, h);
+    let mut max = (0u32, 0u32);
+    for (x, y, m) in mask.enumerate_pixels() {
+        if m.0[0] > 0 {
+            min = (min.0.min(x), min.1.min(y));
+            max = (max.0.max(x + 1), max.1.max(y + 1));
+        }
+    }
+    if max.0 <= min.0 || max.1 <= min.1 {
+        return (0, 0, 0, 0);
+    }
+    (min.0, min.1, max.0 - min.0, max.1 - min.1)
+}
+
 /// Applies an operation only where the mask is set (mask: 255 = op, 0 = keep).
 /// The mask is blurred slightly first to avoid hard aliasing at edges.
+///
+/// Feather, blur and compositing all run on the mask's **bounding box** only —
+/// per-face cost is O(mask bbox) instead of O(full frame), which matters when
+/// an ACTIVE frame holds many faces (one full-frame copy was made per face).
+/// `op` receives the scratch copy plus its origin `(ox, oy)` in frame
+/// coordinates (used by the mosaic to keep blocks aligned to the frame grid).
 fn apply_masked(
     img: &mut image::RgbaImage,
     mask: &image::GrayImage,
     sigma: f32,
-    op: impl Fn(&mut image::RgbaImage),
+    op: impl Fn(&mut image::RgbaImage, i64, i64),
 ) {
     let (w, h) = img.dimensions();
     debug_assert_eq!((w, h), mask.dimensions());
+    let (ox, oy, bw, bh) = mask_bbox(mask);
+    if bw == 0 || bh == 0 {
+        return;
+    }
     let soft: image::GrayImage = {
         let f32_mask: image::ImageBuffer<image::Luma<f32>, Vec<f32>> =
-            image::ImageBuffer::from_fn(w, h, |x, y| {
-                image::Luma([mask.get_pixel(x, y).0[0] as f32])
+            image::ImageBuffer::from_fn(bw, bh, |x, y| {
+                image::Luma([mask.get_pixel(ox + x, oy + y).0[0] as f32])
             });
         let blurred = imageproc::filter::gaussian_blur_f32(&f32_mask, sigma);
-        image::GrayImage::from_fn(w, h, |x, y| {
+        image::GrayImage::from_fn(bw, bh, |x, y| {
             let v = blurred.get_pixel(x, y).0[0];
             image::Luma([v.round().clamp(0.0, 255.0) as u8])
         })
     };
 
-    // Operation on a scratch copy, then alpha-composite per mask value.
-    let mut op_img = img.clone();
-    op(&mut op_img);
+    let mut op_img = image::imageops::crop_imm(img, ox, oy, bw, bh).to_image();
+    op(&mut op_img, ox as i64, oy as i64);
 
     for (x, y, m) in soft.enumerate_pixels() {
         let a = m.0[0] as u32;
         if a == 0 {
             continue;
         }
-        let orig = img.get_pixel(x, y);
+        let orig = img.get_pixel(x + ox, y + oy);
         let processed = op_img.get_pixel(x, y);
         let mixed = [
             ((processed.0[0] as u32 * a + orig.0[0] as u32 * (255 - a)) / 255) as u8,
@@ -205,20 +247,20 @@ fn apply_masked(
             ((processed.0[2] as u32 * a + orig.0[2] as u32 * (255 - a)) / 255) as u8,
             orig.0[3],
         ];
-        *img.get_pixel_mut(x, y) = Rgba(mixed);
+        *img.get_pixel_mut(x + ox, y + oy) = Rgba(mixed);
     }
 }
 
 /// Blur only where the mask is set.
 fn apply_masked_blur(img: &mut image::RgbaImage, mask: &image::GrayImage, sigma: f32) {
-    let (w, h) = img.dimensions();
-    let full = Rect {
-        x0: 0.0,
-        y0: 0.0,
-        x1: w as f32,
-        y1: h as f32,
-    };
-    apply_masked(img, mask, sigma, |scratch| {
+    apply_masked(img, mask, sigma, |scratch, _ox, _oy| {
+        let (w, h) = scratch.dimensions();
+        let full = Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: w as f32,
+            y1: h as f32,
+        };
         blur_region_rgba(scratch, full, sigma)
     });
 }
@@ -230,15 +272,21 @@ fn apply_masked_pixelate(
     mask_sigma: f32,
     cell: u32,
 ) {
-    let (w, h) = img.dimensions();
-    let full = Rect {
-        x0: 0.0,
-        y0: 0.0,
-        x1: w as f32,
-        y1: h as f32,
-    };
-    apply_masked(img, mask, mask_sigma, |scratch| {
-        pixelate_region_rgba(scratch, full, cell)
+    apply_masked(img, mask, mask_sigma, |scratch, ox, oy| {
+        // Operator runs on the mask's bbox crop; the region start(-ox)+local
+        // is a uniform sub-cell shift of the frame-anchored grid (the mosaic
+        // stays block-uniform; the shift is capped at `cell-1` px).
+        let (w, h) = scratch.dimensions();
+        pixelate_region_rgba(
+            scratch,
+            Rect {
+                x0: -(ox as f32),
+                y0: -(oy as f32),
+                x1: w as f32,
+                y1: h as f32,
+            },
+            cell,
+        )
     });
 }
 
@@ -424,6 +472,61 @@ fn mask_from_ellipse(w: u32, h: u32, r: Rect, margin_pct: f32) -> image::GrayIma
     mask
 }
 
+/// Top-left origin of the [`crop_clamped`] crop for `r`, in image coordinates
+/// (same clamping the crop uses, so the segmenter silhouette overlays back on
+/// the frame at the exact pixels it segmented).
+fn clamped_crop_origin(w: u32, h: u32, r: Rect) -> (u32, u32) {
+    (
+        (r.x0.floor() as i64).clamp(0, w as i64 - 1) as u32,
+        (r.y0.floor() as i64).clamp(0, h as i64 - 1) as u32,
+    )
+}
+
+/// Whether the per-face selfie segmenter should run for `det` (ACTIVE).
+/// `cfg.segmenter_min_box_px <= 0` keeps it on every face; otherwise faces
+/// narrower than the threshold are masked geometrically (the 256² ONNX run
+/// buys nothing at tiny sizes and costs ~26 ms per face).
+fn segmenter_applies(cfg: &Config, det: &FaceDetection) -> bool {
+    cfg.segmenter_min_box_px <= 0.0 || det.bbox.width() >= cfg.segmenter_min_box_px
+}
+
+/// ACTIVE mask via the MediaPipe Selfie segmenter (env `MASK_SEGMENTER`):
+/// per-face silhouette dilated 25% of the minor box side (square kernel) in
+/// **union** with the box ellipse (5% margin), so hair/skin never bleeds
+/// beyond the face box. `img` is the original RGB frame; the crop fed to the
+/// model is the same [`crop_clamped`] the classifier uses.
+fn segmenter_mask(
+    w: u32,
+    h: u32,
+    store: &ModelStore,
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    det: &FaceDetection,
+) -> Result<image::GrayImage> {
+    let pool = store
+        .segmenter_pool()
+        .ok_or_else(|| anyhow!("face-mask segmenter not loaded"))?;
+    let crop = crop_clamped(img, det.bbox);
+    let mut sess = pool.acquire()?;
+    let raw = run_selfie_segmenter(&mut sess, &crop)?;
+    drop(sess);
+
+    // Dilation radius: 25% of the minor box side (approved A/B parameter);
+    // float→u8 saturates, bounding the square kernel at 255px.
+    let rad = ((0.25 * det.bbox.width().min(det.bbox.height())).round() as u8).max(2);
+    let dilated =
+        imageproc::morphology::dilate(&raw, imageproc::distance_transform::Norm::LInf, rad);
+
+    // Union with the box ellipse over the full frame.
+    let mut mask = mask_from_ellipse(w, h, det.bbox, 0.05);
+    let (ox, oy) = clamped_crop_origin(w, h, det.bbox);
+    for (x, y, p) in dilated.enumerate_pixels() {
+        if p.0[0] > 0 {
+            mask.put_pixel(ox + x, oy + y, Luma([255u8]));
+        }
+    }
+    Ok(mask)
+}
+
 /// Convex hull of the 5 keypoints (spec §4 ACTIVE polygonal blur).
 pub fn hull_of_keypoints(kps: &Keypoints) -> Vec<(f32, f32)> {
     let pts: Vec<(f64, f64)> = kps.iter().map(|(x, y)| (*x as f64, *y as f64)).collect();
@@ -559,15 +662,41 @@ pub fn process_image(
                     continue; // confirmed false positive → no blur
                 }
 
-                // Anonymization geometry: convex hull of keypoints if
-                // available, otherwise inscribed ellipse (spec §4).
+                // Anonymization geometry: with `MASK_SEGMENTER=mediapipe` a per-face
+                // selfie silhouette (dilated ∪ box ellipse); any segmenter
+                // failure falls back to the geometric hull/ellipse so a face
+                // is never left unblurred by a model hiccup.
                 let sigma = sigma_for_box(det.bbox.width());
-                let mask = match &det.keypoints {
+                let geometry_mask = || match &det.keypoints {
                     Some(kps) => {
                         let hull = hull_of_keypoints(kps);
                         mask_from_polygon(w, h, &hull, cfg.blur_hull_margin_pct)
                     }
                     None => mask_from_ellipse(w, h, det.bbox, 0.05),
+                };
+                let mask = match cfg.mask_segmenter {
+                    MaskSegmenter::Off => geometry_mask(),
+                    MaskSegmenter::Mediapipe => {
+                        // Small faces (below `SEGMENTER_MIN_BOX` px on the
+                        // frame) skip the per-face selfie inference and fall
+                        // back to the geometric mask: at tiny sizes the 256²
+                        // upscale degrades the silhouette and the ~26 ms ONNX
+                        // run per face dominates the ACTIVE budget.
+                        if !segmenter_applies(cfg, det) {
+                            geometry_mask()
+                        } else {
+                            match segmenter_mask(w, h, store, img, det) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "segmenter failed for {:?} — geometric mask fallback: {e}",
+                                        det.bbox
+                                    );
+                                    geometry_mask()
+                                }
+                            }
+                        }
+                    }
                 };
                 op.apply_masked(&mut rgba, &mask, sigma);
                 kept.push(det.clone());
@@ -576,7 +705,9 @@ pub fn process_image(
             Ok(ProcessOutcome {
                 branch: Branch::Active,
                 detections: kept,
-                record_detections: false,
+                // The anonymized centers feed the scheduled dynamic-ROI
+                // re-extraction; the ROI gate already filtered them in.
+                record_detections: true,
                 fp_crops: Vec::new(),
                 processed: rgba,
             })
@@ -592,7 +723,7 @@ fn store_without_models() -> ModelStore {
         std::path::PathBuf::from("/nonexistent/model-for-tests.onnx"),
         0,
     );
-    ModelStore::new(pool, None)
+    ModelStore::new(pool, None, None)
 }
 
 #[cfg(test)]
@@ -706,6 +837,44 @@ mod tests {
     }
 
     #[test]
+    fn masked_mosaic_flattens_blocks_keeps_outside() {
+        let mut img = DynamicImage::ImageRgb8(solid_img(64, 64, 0)).to_rgba8();
+        let mut seed = 7u32;
+        for y in 20..44 {
+            for x in 20..44 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = (seed >> 24) as u8;
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        let mask = mask_from_rect(
+            64,
+            64,
+            Rect {
+                x0: 20.0,
+                y0: 20.0,
+                x1: 44.0,
+                y1: 44.0,
+            },
+        );
+        apply_masked_pixelate(&mut img, &mask, 1.0, 8);
+        // Inside the mask the mosaic flattens the noise: two mid-block pixels
+        // (same average, near-equal feather weight) must be near-identical
+        // (the mask feather is ~98% opaque, so a small bleed of the original
+        // remains — tolerance 8 covers it).
+        let a = img.get_pixel(25, 25).0;
+        let b = img.get_pixel(26, 26).0;
+        assert!(
+            a[0].abs_diff(b[0]) <= 8 && a[0] < 200,
+            "masked mosaic flattened block, got {a:?} vs {b:?}"
+        );
+        // Outside the mask is untouched.
+        assert_eq!(img.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        // Inside the mask the mosaic is visible (non-black block average).
+        assert_ne!(a, [0, 0, 0, 255]);
+    }
+
+    #[test]
     fn ellipse_mask_covers_center_not_corners() {
         let m = mask_from_ellipse(
             100,
@@ -769,5 +938,83 @@ mod tests {
         };
         let crop = crop_clamped(&img, far);
         assert_eq!(crop.dimensions(), (50, 50));
+    }
+
+    #[test]
+    fn small_faces_skip_the_segmenter() {
+        use crate::models::FaceDetection;
+        let cfg = Config::test_default();
+        let small = FaceDetection {
+            bbox: Rect {
+                x0: 10.0,
+                y0: 10.0,
+                x1: 40.0,
+                y1: 50.0,
+            },
+            confidence: 0.9,
+            keypoints: None,
+        };
+        let big = FaceDetection {
+            bbox: Rect {
+                x0: 10.0,
+                y0: 10.0,
+                x1: 110.0,
+                y1: 130.0,
+            },
+            confidence: 0.9,
+            keypoints: None,
+        };
+        // Threshold unset (0) → segmenter always applies.
+        assert!(segmenter_applies(&cfg, &small));
+        assert!(segmenter_applies(&cfg, &big));
+        // Threshold 64 px → the 30 px box is masked geometrically...
+        let mut cfg2 = cfg.clone();
+        cfg2.segmenter_min_box_px = 64.0;
+        assert!(!segmenter_applies(&cfg2, &small));
+        // ...while the 100 px box still runs the segmenter.
+        assert!(segmenter_applies(&cfg2, &big));
+    }
+
+    #[test]
+    #[ignore = "requires the selfie segmentation model + parade photo on disk"]
+    fn segmenter_mask_unions_ellipse_and_silhouette() {
+        use crate::models::{ModelStore, SessionPool, FaceDetection};
+        use std::path::PathBuf;
+        let model = std::path::PathBuf::from("models_cache/model_quantized.onnx");
+        let photo = std::path::PathBuf::from("testassets/0_Parade_marchingband_1_1004.jpg");
+        if !model.exists() || !photo.exists() {
+            eprintln!("segmenter-mask assets missing; skipping");
+            return;
+        }
+        let img = image::open(&photo).unwrap().to_rgb8();
+        let (w, h) = img.dimensions();
+        // The reference top face box (parade photo), slightly dilated.
+        let det = FaceDetection {
+            bbox: Rect {
+                x0: 620.0,
+                y0: 170.0,
+                x1: 710.0,
+                y1: 260.0,
+            },
+            confidence: 0.99,
+            keypoints: None,
+        };
+        let pool = SessionPool::new(model, 2);
+        let store = ModelStore::new(
+            SessionPool::new(PathBuf::from("/nonexistent/yolo.onnx"), 1),
+            None,
+            Some(pool),
+        );
+        let mask = segmenter_mask(w, h, &store, &img, &det).unwrap();
+        assert_eq!(mask.dimensions(), (w, h));
+        // Silhouette covers the face center.
+        assert_eq!(mask.get_pixel(665, 215).0[0], 255);
+        // The union is a superset of the plain box ellipse.
+        let ell = mask_from_ellipse(w, h, det.bbox, 0.05);
+        let covered = mask.iter().filter(|&&v| v > 0).count();
+        let ell_covered = ell.iter().filter(|&&v| v > 0).count();
+        assert!(covered >= ell_covered, "{covered} < {ell_covered}");
+        // Far from the face the frame stays uncovered.
+        assert_eq!(mask.get_pixel(100, 5).0[0], 0);
     }
 }

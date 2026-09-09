@@ -35,7 +35,7 @@ sevenz-rust = "0.5"
 unrar = "0.5"
 # CRC32 for verifying fallback LZMA decodes against the entry's stored checksum.
 crc32fast = "1"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "gzip", "json"] }
 ndarray = "0.15"
 geo = "0.28"
 arc-swap = "1.7"
@@ -52,12 +52,36 @@ futures-util = "0.3"
 
 pyo3 = { version = "0.21", features = ["auto-initialize"], optional = true }
 
+# S3 ingress/egress backend (feature `s3`, spec §8 S3 integration): the AWS
+# SDK for Rust with rustls + tokio. `behavior-version-latest` pins the AWS
+# config global behavior to the latest SDK semantics instead of a frozen
+# default. Gated like `retraining` so the default CPU build stays lean; the
+# Docker images keep using the plain (local-disk) storage unless built with
+# `--features s3`.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"], optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"], optional = true }
+# Unique keys / temp file names for S3 jobs (aza service already uses UUIDs
+# in the database layer; this one is scoped to the S3 worker).
+uuid = { version = "1", features = ["v4"], optional = true }
+
 [features]
 default = []
 # PyO3/Python retraining bridge (spec §6). Enabled by default in the Docker
 # build (Dockerfile uses --features retraining with a Python 3.12 base image);
 # keep it off for plain `cargo build` where no Python interpreter is present.
 retraining = ["dep:pyo3"]
+# GPU execution providers (ORT prebuilt binaries, CUDA 13 + cuDNN 9). Each
+# needs the matching system runtime at deploy time; see Dockerfile.gpu and
+# the README "Inference backend (GPU)" section. The plain CPU build stays the
+# default (no GPU toolchain required to compile).
+cuda = ["ort/cuda"]
+tensorrt = ["ort/cuda", "ort/tensorrt"]
+directml = ["ort/directml"]
+# S3 ingestion/storage backend: async job intake from a bucket + streaming
+# put/get of the anonymized archives, presigned download links, audit logs and
+# optional completion webhooks. Requires the AWS SDK deps (compile-time cost is
+# sizeable — keep off for the minimal CPU build).
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:uuid"]
 
 [profile.release]
 opt-level = 3

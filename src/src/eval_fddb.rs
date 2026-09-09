@@ -234,7 +234,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 continue;
             }
         };
-        let dets = run_yolo(&mut session, &img, det_conf, nms_iou)
+        let dets = run_yolo(&mut session, &img, det_conf, nms_iou, 640)
             .with_context(|| format!("inference on {} failed", img_path.display()))?;
         let mut dets: Vec<(f32, f32, f32, f32, f32)> = dets
             .into_iter()

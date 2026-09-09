@@ -1,0 +1,63 @@
+services:
+  anonimizzazione-volti-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: anonimizzazione-volti-gpu:latest
+    container_name: anonimizzazione-volti-gpu
+    restart: unless-stopped
+    # NVIDIA GPU passthrough (NVIDIA Container Toolkit, installed on the host).
+    #  `deploy.resources.reservations.devices` is the modern replacement for
+    #  the legacy `runtime: nvidia` (kept commented for older-style hosts).
+    #  runtime: nvidia
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env   # must set ORT_EXECUTION_PROVIDER=cuda (and the GPU knobs below)
+    environment:
+      # Overridable defaults (see .env.example for every knob).
+      BIND_ADDR: "0.0.0.0:8080"
+      # GPU inference: the session pool still provides concurrency, but each
+      # GPU session holds its own device-memory arena — keep this moderate or
+      # bound the arena with ORT_CUDA_MEMORY_LIMIT_BYTES.
+      MAX_CONCURRENT_IMAGES: "8"
+      CRON_RETRAIN_SCHEDULE: "03:00"    # HH:MM local
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:-change-me-operator-key}"
+      ORT_EXECUTION_PROVIDER: cuda
+      ORT_CUDA_DEVICE_ID: "${ORT_CUDA_DEVICE_ID:-0}"
+      ORT_CUDA_MEMORY_LIMIT_BYTES: "${ORT_CUDA_MEMORY_LIMIT_BYTES:-}"  # e.g. 8589934592 (8 GiB)
+      ORT_ENABLE_TF32: "${ORT_ENABLE_TF32:-true}"   # Ampere+; harmless elsewhere
+      ORT_ENABLE_FP16: "${ORT_ENABLE_FP16:-false}"  # TensorRT only
+      RETENTION_ENABLED: "${RETENTION_ENABLED:-true}"
+      RETENTION_MAX_DAYS: "${RETENTION_MAX_DAYS:-30}"
+      RETENTION_MAX_GB: "${RETENTION_MAX_GB:-20.0}"
+    volumes:
+      - models:/app/models
+      - data:/app/data
+      - fp_crops:/app/dataset_falsi_positivi
+      - seed:/app/dataset_seed
+    mem_limit: 32g
+    deploy:
+      resources:
+        limits:
+          memory: 32g
+          # Unitless cgroup reservation is enough for scheduling; the NVIDIA
+          # devices are requested below.
+        reservations:
+          memory: 16g
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  models:
+  data:
+  fp_crops:
+  seed:

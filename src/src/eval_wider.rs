@@ -404,7 +404,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 continue;
             }
         };
-        let dets = run_yolo(&mut session, &img, det_conf, nms_iou)
+        let dets = run_yolo(&mut session, &img, det_conf, nms_iou, 640)
             .with_context(|| format!("inference on {} failed", img_path.display()))?;
         tracing::debug!("eval-wider: {} → {} detections", gt_img.name, dets.len());
         for (i, d) in dets.iter().take(6).enumerate() {

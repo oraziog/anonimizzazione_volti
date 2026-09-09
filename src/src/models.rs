@@ -155,19 +155,32 @@ impl std::ops::DerefMut for PooledSession<'_> {
 pub struct ModelStore {
     pub yolo: Arc<SessionPool>,
     classifier: Arc<arc_swap::ArcSwap<Option<Arc<SessionPool>>>>,
+    /// Optional ACTIVE face-mask segmenter (MediaPipe Selfie, spec §4 —
+    /// `MASK_SEGMENTER=mediapipe`). `None` keeps geometric masks.
+    segmenter: Option<Arc<SessionPool>>,
 }
 
 impl ModelStore {
-    pub fn new(yolo: SessionPool, classifier: Option<SessionPool>) -> Self {
+    pub fn new(
+        yolo: SessionPool,
+        classifier: Option<SessionPool>,
+        segmenter: Option<SessionPool>,
+    ) -> Self {
         Self {
             yolo: Arc::new(yolo),
             classifier: Arc::new(arc_swap::ArcSwap::from_pointee(classifier.map(Arc::new))),
+            segmenter: segmenter.map(Arc::new),
         }
     }
 
     /// Current classifier pool, if one is configured/swapped in.
     pub fn classifier_pool(&self) -> Option<Arc<SessionPool>> {
         self.classifier.load().as_ref().clone()
+    }
+
+    /// The ACTIVE face-mask segmenter pool, if `MASK_SEGMENTER=mediapipe`.
+    pub fn segmenter_pool(&self) -> Option<Arc<SessionPool>> {
+        self.segmenter.clone()
     }
 
     /// Atomically swaps in a new classifier pool (pre-validated by the
@@ -225,8 +238,6 @@ pub struct FaceDetection {
 
 // ─── YOLO preprocessing (letterbox) ──────────────────────────────────────────
 
-pub const YOLO_INPUT: u32 = 640;
-
 /// Letterbox parameters for a given source size.
 #[derive(Debug, Clone, Copy)]
 pub struct LetterboxParams {
@@ -235,23 +246,27 @@ pub struct LetterboxParams {
     pub pad_y: f32,
 }
 
-/// Computes letterbox parameters mapping source → 640×640.
-pub fn letterbox_params(src_w: u32, src_h: u32) -> LetterboxParams {
-    let scale = (YOLO_INPUT as f32 / src_w as f32).min(YOLO_INPUT as f32 / src_h as f32);
+/// Computes letterbox parameters mapping source → `input`×`input`.
+pub fn letterbox_params(src_w: u32, src_h: u32, input: u32) -> LetterboxParams {
+    let scale = (input as f32 / src_w as f32).min(input as f32 / src_h as f32);
     let new_w = src_w as f32 * scale;
     let new_h = src_h as f32 * scale;
     LetterboxParams {
         scale,
-        pad_x: (YOLO_INPUT as f32 - new_w) / 2.0,
-        pad_y: (YOLO_INPUT as f32 - new_h) / 2.0,
+        pad_x: (input as f32 - new_w) / 2.0,
+        pad_y: (input as f32 - new_h) / 2.0,
     }
 }
 
-/// Builds the CHW f32 RGB input tensor `[1,3,640,640]` (spec §4) from an RGB8 image.
-pub fn build_yolo_input(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> Vec<f32> {
+/// Builds the CHW f32 RGB input tensor `[1,3,input,input]` from an RGB8 image.
+pub fn build_yolo_input(
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    input: u32,
+) -> Vec<f32> {
     let (w, h) = (img.width(), img.height());
-    let lb = letterbox_params(w, h);
-    let mut out = vec![0f32; (3 * YOLO_INPUT * YOLO_INPUT) as usize];
+    let lb = letterbox_params(w, h, input);
+    let n_in = input as usize;
+    let mut out = vec![0f32; 3 * n_in * n_in];
     let dst_w = (w as f32 * lb.scale).round().max(1.0) as u32;
     let dst_h = (h as f32 * lb.scale).round().max(1.0) as u32;
 
@@ -262,20 +277,19 @@ pub fn build_yolo_input(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> Ve
     for (x, y, p) in resized.enumerate_pixels() {
         let dx = x as i64 + pad_x;
         let dy = y as i64 + pad_y;
-        if dx < 0 || dy < 0 || dx >= YOLO_INPUT as i64 || dy >= YOLO_INPUT as i64 {
+        if dx < 0 || dy < 0 || dx >= input as i64 || dy >= input as i64 {
             continue;
         }
         let (dx, dy) = (dx as usize, dy as usize);
         let [r, g, b] = p.0;
-        let n = YOLO_INPUT as usize;
-        out[dx + dy * n] = r as f32 / 255.0;
-        out[n * n + dx + dy * n] = g as f32 / 255.0;
-        out[2 * n * n + dx + dy * n] = b as f32 / 255.0;
+        out[dx + dy * n_in] = r as f32 / 255.0;
+        out[n_in * n_in + dx + dy * n_in] = g as f32 / 255.0;
+        out[2 * n_in * n_in + dx + dy * n_in] = b as f32 / 255.0;
     }
     out
 }
 
-/// Maps a point from letterboxed 640×640 coordinates back to source pixels.
+/// Maps a point from letterboxed `input`×`input` coordinates back to source pixels.
 pub fn letterbox_to_src(x: f32, y: f32, lb: &LetterboxParams) -> (f32, f32) {
     ((x - lb.pad_x) / lb.scale, (y - lb.pad_y) / lb.scale)
 }
@@ -319,7 +333,6 @@ pub fn iou(a: &Rect, b: &Rect) -> f32 {
 
 // ─── RetinaFace (mobilenetv1_0.25) preprocessing & output parsing ────────────
 
-pub const RETINA_INPUT: u32 = 640;
 /// BGR mean used by the reference RetinaFace inference code (opencv order).
 pub const RETINA_MEAN_BGR: [f32; 3] = [104.0, 117.0, 123.0];
 /// FPN anchor scales per stride (mobile0.25 config, spec WIDER: [[16,32],...]).
@@ -327,18 +340,22 @@ const RETINA_MIN_SIZES: [[u32; 2]; 3] = [[16, 32], [64, 128], [256, 512]];
 const RETINA_STEPS: [u32; 3] = [8, 16, 32];
 const RETINA_VAR: [f32; 2] = [0.1, 0.2];
 
-/// Generates the 16800 normalized priors `[cx, cy, s_kx, s_ky]` for a 640×640
-/// model input, replicating `PriorBox.generate_anchors` (box_utils/prior_box).
-pub fn generate_retinaface_priors() -> Vec<[f32; 4]> {
-    let mut out = Vec::with_capacity(16_800);
+/// Generates the normalized priors `[cx, cy, s_kx, s_ky]` (16800 at 640×640)
+/// for a given model input side, replicating `PriorBox.generate_anchors`.
+pub fn generate_retinaface_priors(input: u32) -> Vec<[f32; 4]> {
+    let perf_cells = RETINA_STEPS
+        .iter()
+        .map(|s| ((input / s) as usize) * ((input / s) as usize) * 2)
+        .sum();
+    let mut out = Vec::with_capacity(perf_cells);
     for (k, step) in RETINA_STEPS.iter().enumerate() {
-        let cells = RETINA_INPUT / step;
+        let cells = input / step;
         for i in 0..cells {
             for j in 0..cells {
-                let cx = (j as f32 + 0.5) * *step as f32 / RETINA_INPUT as f32;
-                let cy = (i as f32 + 0.5) * *step as f32 / RETINA_INPUT as f32;
+                let cx = (j as f32 + 0.5) * *step as f32 / input as f32;
+                let cy = (i as f32 + 0.5) * *step as f32 / input as f32;
                 for ms in RETINA_MIN_SIZES[k] {
-                    let size = ms as f32 / RETINA_INPUT as f32;
+                    let size = ms as f32 / input as f32;
                     out.push([cx, cy, size, size]);
                 }
             }
@@ -347,14 +364,17 @@ pub fn generate_retinaface_priors() -> Vec<[f32; 4]> {
     out
 }
 
-/// Builds the CHW f32 input `[1,3,640,640]` for the ONNX RetinaFace models:
-/// stretch-resize to square, BGR channel order, `mean` already subtracted.
-pub fn build_retinaface_input(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> Vec<f32> {
-    let n = RETINA_INPUT as usize;
+/// Builds the CHW f32 input `[1,3,input,input]` for the ONNX RetinaFace
+/// models: stretch-resize to square, BGR channel order, `mean` subtracted.
+pub fn build_retinaface_input(
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    input: u32,
+) -> Vec<f32> {
+    let n = input as usize;
     let resized = image::imageops::resize(
         img,
-        RETINA_INPUT,
-        RETINA_INPUT,
+        input,
+        input,
         image::imageops::FilterType::Triangle,
     );
     let mut out = vec![0f32; 3 * n * n];
@@ -431,12 +451,13 @@ pub fn run_retinaface(
     img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     conf_threshold: f32,
     nms_iou: f32,
+    input: u32,
 ) -> Result<Vec<FaceDetection>> {
     let (w, h) = img.dimensions();
-    let input = build_retinaface_input(img);
+    let input_data = build_retinaface_input(img, input);
     let tensor = ort::value::Tensor::from_array((
-        vec![1i64, 3, RETINA_INPUT as i64, RETINA_INPUT as i64],
-        input,
+        vec![1i64, 3, input as i64, input as i64],
+        input_data,
     ))
     .map_err(|e| anyhow!("build RetinaFace input tensor: {e}"))?;
     let outputs = session
@@ -463,10 +484,71 @@ pub fn run_retinaface(
     if n_priors == 0 {
         return Err(anyhow!("RetinaFace outputs carry no anchors"));
     }
-    let priors = generate_retinaface_priors();
+    let priors = generate_retinaface_priors(input);
     let mut dets = decode_retinaface(loc, conf, lm, &priors, conf_threshold, w, h);
     dets = nms(dets, nms_iou);
     Ok(dets)
+}
+
+// ─── Inference instrumentation (operator /operator/gpu) ─────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Measured per-stage inference statistics. Counters are incremented by the
+/// public inference entry points below (`run_detector`, `run_classifier`,
+/// `run_selfie_segmenter`) and served by `GET /operator/gpu`; they are
+/// process-lifetime accumulators over every image ever processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceStage {
+    Detector,
+    Classifier,
+    Segmenter,
+}
+
+const INFER_STAGE_NAMES: [(&str, InferenceStage); 3] = [
+    ("detector", InferenceStage::Detector),
+    ("classifier", InferenceStage::Classifier),
+    ("segmenter", InferenceStage::Segmenter),
+];
+
+static INFER_COUNT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static INFER_NANOS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn infer_index(stage: InferenceStage) -> usize {
+    match stage {
+        InferenceStage::Detector => 0,
+        InferenceStage::Classifier => 1,
+        InferenceStage::Segmenter => 2,
+    }
+}
+
+/// Records one inference run (`elapsed` includes the ONNX `Session::run`).
+pub fn record_inference(stage: InferenceStage, elapsed: std::time::Duration) {
+    let idx = infer_index(stage);
+    INFER_COUNT[idx].fetch_add(1, Ordering::Relaxed);
+    INFER_NANOS[idx].fetch_add(
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// Snapshot of the measured inference statistics, stable ordering
+/// `[detector, classifier, segmenter]`, `(stage, count, avg_ms)`.
+pub fn inference_stats() -> Vec<(&'static str, u64, f64)> {
+    INFER_STAGE_NAMES
+        .iter()
+        .map(|(name, stage)| {
+            let idx = infer_index(*stage);
+            let count = INFER_COUNT[idx].load(Ordering::Relaxed);
+            let nanos = INFER_NANOS[idx].load(Ordering::Relaxed);
+            let avg_ms = if count == 0 {
+                0.0
+            } else {
+                nanos as f64 / count as f64 / 1_000_000.0
+            };
+            (*name, count, avg_ms)
+        })
+        .collect()
 }
 
 /// Dispatches face detection to the configured detector (YOLO or RetinaFace).
@@ -476,14 +558,26 @@ pub fn run_detector(
     img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     conf_threshold: f32,
 ) -> Result<Vec<FaceDetection>> {
+    let started = std::time::Instant::now();
     let mut session = store.yolo.acquire()?;
     let dets = match cfg.detector_mode {
-        DetectorMode::Yolo => run_yolo(&mut session, img, conf_threshold, cfg.yolo_nms_iou),
-        DetectorMode::RetinaFace => {
-            run_retinaface(&mut session, img, conf_threshold, cfg.yolo_nms_iou)
-        }
+        DetectorMode::Yolo => run_yolo(
+            &mut session,
+            img,
+            conf_threshold,
+            cfg.yolo_nms_iou,
+            cfg.yolo_input_size,
+        ),
+        DetectorMode::RetinaFace => run_retinaface(
+            &mut session,
+            img,
+            conf_threshold,
+            cfg.yolo_nms_iou,
+            cfg.retinaface_input_size,
+        ),
     }?;
     drop(session);
+    record_inference(InferenceStage::Detector, started.elapsed());
     Ok(dets)
 }
 
@@ -551,13 +645,14 @@ fn decode_dfl_face_grid(
     grid_w: u32,
     grid_h: u32,
     conf_threshold: f32,
+    input_px: f32,
 ) -> Vec<RawDet> {
     const CH: usize = 80;
     let hw = (grid_w * grid_h) as usize;
     if grid_w == 0 || grid_h == 0 || data.len() < CH * hw {
         return Vec::new();
     }
-    let stride = YOLO_INPUT as f32 / grid_w as f32;
+    let stride = input_px / grid_w as f32;
     let cell =
         |ch: usize, x: u32, y: u32| data[ch * hw + (y as usize) * grid_w as usize + x as usize];
 
@@ -637,12 +732,13 @@ pub fn run_yolo(
     img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     conf_threshold: f32,
     nms_iou: f32,
+    input: u32,
 ) -> Result<Vec<FaceDetection>> {
     let (w, h) = (img.width(), img.height());
-    let input = build_yolo_input(img);
+    let input_data = build_yolo_input(img, input);
     let tensor = ort::value::Tensor::from_array((
-        vec![1i64, 3, YOLO_INPUT as i64, YOLO_INPUT as i64],
-        input,
+        vec![1i64, 3, input as i64, input as i64],
+        input_data,
     ))
     .map_err(|e| anyhow!("build YOLO input tensor: {e}"))?;
     let outputs = session
@@ -652,7 +748,7 @@ pub fn run_yolo(
     if outputs.len() == 0 {
         return Err(anyhow!("YOLO model returned no outputs"));
     }
-    let lb = letterbox_params(w, h);
+    let lb = letterbox_params(w, h, input);
     let mut raws: Vec<RawDet> = Vec::new();
 
     for value in outputs.values() {
@@ -668,6 +764,7 @@ pub fn run_yolo(
                     *gw as u32,
                     *gh as u32,
                     conf_threshold,
+                    input as f32,
                 ));
             }
             // Classic transposed layout [1, C, anchors].
@@ -788,28 +885,162 @@ pub fn run_classifier(
     session: &mut ort::session::Session,
     crop: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
 ) -> Result<(f32, f32)> {
-    let input = build_classifier_input(crop);
-    let tensor = ort::value::Tensor::from_array((vec![1i64, 3, 224, 224], input))
-        .map_err(|e| anyhow!("build classifier input tensor: {e}"))?;
-    let outputs = session
-        .run(ort::inputs![tensor])
-        .map_err(|e| anyhow!("classifier inference failed: {e}"))?;
-    if outputs.len() == 0 {
-        return Err(anyhow!("classifier returned no outputs"));
+    let started = std::time::Instant::now();
+    let result = (|| -> Result<(f32, f32)> {
+        let input = build_classifier_input(crop);
+        let tensor = ort::value::Tensor::from_array((vec![1i64, 3, 224, 224], input))
+            .map_err(|e| anyhow!("build classifier input tensor: {e}"))?;
+        let outputs = session
+            .run(ort::inputs![tensor])
+            .map_err(|e| anyhow!("classifier inference failed: {e}"))?;
+        if outputs.len() == 0 {
+            return Err(anyhow!("classifier returned no outputs"));
+        }
+        let value = &outputs[0];
+        let (shape, data) = value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("classifier output not f32 tensor: {e}"))?;
+        if shape.iter().sum::<i64>() < 2 || data.len() < 2 {
+            return Err(anyhow!("classifier output shape too small"));
+        }
+        Ok(softmax2(data[0], data[1]))
+    })();
+    if result.is_ok() {
+        record_inference(InferenceStage::Classifier, started.elapsed());
     }
-    let value = &outputs[0];
-    let (shape, data) = value
-        .try_extract_tensor::<f32>()
-        .map_err(|e| anyhow!("classifier output not f32 tensor: {e}"))?;
-    if shape.iter().sum::<i64>() < 2 || data.len() < 2 {
-        return Err(anyhow!("classifier output shape too small"));
+    result
+}
+
+// ─── Selfie segmentation (ACTIVE mask, MASK_SEGMENTER=mediapipe) ─────────────
+
+/// Stretch-resize side of the MediaPipe Selfie Segmentation input (spec A/B:
+/// 256×256, RGB, /255).
+pub const SELFIE_SEG_INPUT: u32 = 256;
+
+/// Builds the CHW f32 RGB input `[1,3,256,256]` from a face crop, normalized
+/// to [0,1] (mediapipe convention; RGB order, no mean subtraction).
+pub fn build_selfie_segmenter_input(
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+) -> Vec<f32> {
+    let n = SELFIE_SEG_INPUT as usize;
+    let resized = image::imageops::resize(
+        img,
+        SELFIE_SEG_INPUT,
+        SELFIE_SEG_INPUT,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut out = vec![0f32; 3 * n * n];
+    for (x, y, p) in resized.enumerate_pixels() {
+        let [r, g, b] = p.0;
+        let idx = y as usize * n + x as usize;
+        out[idx] = r as f32 / 255.0;
+        out[n * n + idx] = g as f32 / 255.0;
+        out[2 * n * n + idx] = b as f32 / 255.0;
     }
-    Ok(softmax2(data[0], data[1]))
+    out
+}
+
+/// Runs the MediaPipe Selfie Segmentation model on a face crop and returns the
+/// binary silhouette resized back to crop dimensions (255 inside the person).
+///
+/// Pipeline mirrors the approved A/B (`scripts/mask_preview.py`):
+/// input 256×256 → `alphas` sigmoid → threshold > 0.5 → resize back (linear)
+/// → re-threshold > 127.
+pub fn run_selfie_segmenter(
+    session: &mut ort::session::Session,
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+) -> Result<image::GrayImage> {
+    let started = std::time::Instant::now();
+    let result = (|| -> Result<image::GrayImage> {
+        let (cw, ch) = img.dimensions();
+        let input = build_selfie_segmenter_input(img);
+        let tensor = ort::value::Tensor::from_array((
+            vec![1i64, 3, SELFIE_SEG_INPUT as i64, SELFIE_SEG_INPUT as i64],
+            input,
+        ))
+        .map_err(|e| anyhow!("build Selfie input tensor: {e}"))?;
+        let outputs = session
+            .run(ort::inputs![tensor])
+            .map_err(|e| anyhow!("Selfie segmentation failed: {e}"))?;
+
+        // The exported model emits a single `[1,1,256,256]` `alphas` map. Accept
+        // any f32 output with ≥ 256² samples (some exports drop the channel dim),
+        // copying the slice so the tensor borrow does not outlive the outputs.
+        let mut alphas: Option<Vec<f32>> = None;
+        for value in outputs.values() {
+            let (shape, data) = value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("Selfie output not f32 tensor: {e}"))?;
+            let _ = shape; // dims not needed beyond the sample-count guard below
+            if data.len() >= (SELFIE_SEG_INPUT as usize).pow(2) {
+                alphas = Some(data[..(SELFIE_SEG_INPUT as usize).pow(2)].to_vec());
+                break;
+            }
+        }
+        let Some(alphas) = alphas else {
+            return Err(anyhow!("Selfie segmentation returned no 256×256 output"));
+        };
+        let n = SELFIE_SEG_INPUT as usize;
+        let mut mask256 = image::GrayImage::from_pixel(
+            SELFIE_SEG_INPUT,
+            SELFIE_SEG_INPUT,
+            image::Luma([0u8]),
+        );
+        for y in 0..n {
+            for x in 0..n {
+                if alphas[y * n + x] > 0.5 {
+                    mask256.put_pixel(x as u32, y as u32, image::Luma([255u8]));
+                }
+            }
+        }
+        let resized =
+            image::imageops::resize(&mask256, cw, ch, image::imageops::FilterType::Triangle);
+        let mut mask = image::GrayImage::from_pixel(cw, ch, image::Luma([0u8]));
+        for (x, y, p) in resized.enumerate_pixels() {
+            if p.0[0] > 127 {
+                mask.put_pixel(x, y, image::Luma([255u8]));
+            }
+        }
+        Ok(mask)
+    })();
+    if result.is_ok() {
+        record_inference(InferenceStage::Segmenter, started.elapsed());
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_stats_record_and_snapshot() {
+        // The counters are process-lifetime, so assert on deltas around two
+        // recorded detector runs (25 ms + 75 ms → avg 50 ms) plus a stable
+        // snapshot ordering.
+        let before: Vec<_> = inference_stats();
+        record_inference(
+            InferenceStage::Detector,
+            std::time::Duration::from_millis(25),
+        );
+        record_inference(
+            InferenceStage::Detector,
+            std::time::Duration::from_millis(75),
+        );
+        let after: Vec<_> = inference_stats();
+        let by_name = |v: &Vec<(&'static str, u64, f64)>, n: &str| {
+            *v.iter()
+                .find(|(name, _, _)| *name == n)
+                .expect("stage present")
+        };
+        let (name, count_b, avg_b) = by_name(&before, "detector");
+        let (_, count_a, avg_a) = by_name(&after, "detector");
+        assert_eq!(name, "detector");
+        assert_eq!(count_a - count_b, 2);
+        assert!(((avg_a * count_a as f64 - avg_b * count_b as f64) / 2.0 - 50.0).abs() < 1e-6);
+        let names: Vec<&'static str> = after.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names, vec!["detector", "classifier", "segmenter"]);
+    }
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
         Rect { x0, y0, x1, y1 }
@@ -817,7 +1048,7 @@ mod tests {
 
     #[test]
     fn letterbox_roundtrip() {
-        let lb = letterbox_params(1920, 1080);
+        let lb = letterbox_params(1920, 1080, 640);
         assert!((lb.scale - 640.0 / 1920.0).abs() < 1e-6);
         let (sx, sy) = letterbox_to_src(320.0, 320.0, &lb);
         assert!((sx - 960.0).abs() < 1.0);
@@ -846,7 +1077,7 @@ mod tests {
             data[(65 + k * 3 + 2) * hw] = 8.0;
         }
 
-        let raws = decode_dfl_face_grid(&data, grid_w, grid_h, 0.2);
+        let raws = decode_dfl_face_grid(&data, grid_w, grid_h, 0.2, 640.0);
         assert_eq!(raws.len(), 1);
         let r = &raws[0];
         // stride = 640/1 → x1=(0.5-0)*640=320, x2=(0.5+2)*640=1600, etc.
@@ -867,7 +1098,7 @@ mod tests {
         let mut data = vec![-100.0f32; 80];
         // objectness low → filtered.
         data[64] = -20.0;
-        assert!(decode_dfl_face_grid(&data, grid_w, grid_h, 0.2).is_empty());
+        assert!(decode_dfl_face_grid(&data, grid_w, grid_h, 0.2, 640.0).is_empty());
     }
 
     #[test]
@@ -887,7 +1118,7 @@ mod tests {
         }
         data[19] = 0.7; // class score (single class)
 
-        let lb = letterbox_params(640, 640);
+        let lb = letterbox_params(640, 640, 640);
         let raws = parse_yolo_output_raw(&shape, &data, 0.20, &lb);
         assert_eq!(raws.len(), 1);
         assert!((raws[0].conf - 0.7).abs() < 1e-6);
@@ -899,7 +1130,7 @@ mod tests {
 
     #[test]
     fn parse_raw_rejects_bad_shapes() {
-        let lb = letterbox_params(640, 640);
+        let lb = letterbox_params(640, 640, 640);
         assert!(parse_yolo_output_raw(&[1, 5], &[], 0.2, &lb).is_empty());
         assert!(parse_yolo_output_raw(&[2, 5, 10], &[], 0.2, &lb).is_empty());
     }
@@ -942,6 +1173,39 @@ mod tests {
     }
 
     #[test]
+    fn selfie_segmenter_input_layout() {
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(4, 5, image::Rgb([10, 20, 30]));
+        let input = build_selfie_segmenter_input(&img);
+        assert_eq!(input.len(), 3 * 256 * 256);
+        // Top-left pixel: RGB order, /255 normalization.
+        assert!((input[0] - 10.0 / 255.0).abs() < 1e-6);
+        assert!((input[256 * 256] - 20.0 / 255.0).abs() < 1e-6);
+        assert!((input[2 * 256 * 256] - 30.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[ignore = "requires the selfie segmentation model on disk"]
+    fn real_selfie_segmenter_smoke() {
+        let model = std::path::PathBuf::from("models_cache/model_quantized.onnx");
+        let photo = std::path::PathBuf::from("testassets/0_Parade_marchingband_1_1004.jpg");
+        if !model.exists() || !photo.exists() {
+            eprintln!("selfie smoke assets missing; skipping");
+            return;
+        }
+        let mut session = crate::model_loader::load_session(&model).unwrap();
+        let img = image::open(&photo).unwrap().to_rgb8();
+        // Parade photo: the reference top face box, crop of a real person.
+        let crop = image::imageops::crop_imm(&img, 644, 193, 50, 50).to_image();
+        let mask = run_selfie_segmenter(&mut session, &crop).unwrap();
+        assert_eq!(mask.dimensions(), (50, 50));
+        let covered = mask.iter().filter(|&&v| v > 0).count();
+        eprintln!("selfie smoke: {covered}/{} masked pixels", 50 * 50);
+        // A person's face crop must yield a non-empty silhouette.
+        assert!(covered > 0, "expected a visible selfie silhouette in the crop");
+    }
+
+    #[test]
     fn softmax2_sums_to_one() {
         let (a, b) = softmax2(2.0, 1.0);
         assert!((a + b - 1.0).abs() < 1e-6);
@@ -956,7 +1220,7 @@ mod tests {
 
     #[test]
     fn retinaface_priors_structure() {
-        let priors = generate_retinaface_priors();
+        let priors = generate_retinaface_priors(640);
         assert_eq!(priors.len(), 16_800);
         // Level 0 (stride 8): cell (0,0), first size 16 → 640×640 normalized.
         let p0 = priors[0];
@@ -978,10 +1242,22 @@ mod tests {
     }
 
     #[test]
+    fn retinaface_priors_scales_with_input() {
+        // 512×512 → cells 64/32/16, two anchors per cell.
+        let priors = generate_retinaface_priors(512);
+        assert_eq!(priors.len(), 2 * (64 * 64 + 32 * 32 + 16 * 16));
+        let p0 = priors[0];
+        assert!((p0[0] - (0.5 * 8.0 / 512.0)).abs() < 1e-6);
+        assert!((p0[2] - 16.0 / 512.0).abs() < 1e-6);
+        let p_last = priors[2 * 64 * 64 - 1];
+        assert!((p_last[0] - (63.5 * 8.0 / 512.0)).abs() < 1e-4);
+    }
+
+    #[test]
     fn retinaface_input_layout_bgr_mean() {
         let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             image::ImageBuffer::from_pixel(4, 4, image::Rgb([10, 20, 30]));
-        let input = build_retinaface_input(&img);
+        let input = build_retinaface_input(&img, 640);
         assert_eq!(input.len(), 3 * 640 * 640);
         // BGR order with mean subtraction at the top-left pixel.
         assert!((input[0] - (30.0 - 104.0)).abs() < 1e-5);
@@ -991,11 +1267,11 @@ mod tests {
 
     #[test]
     fn retinaface_decode_synthetic() {
-        let priors = generate_retinaface_priors();
+        let priors = generate_retinaface_priors(640);
         let n = priors.len();
-        let mut loc = vec![0f32; n * 4];
+        let loc = vec![0f32; n * 4];
         let mut conf = vec![0f32; n * 2];
-        let mut lm = vec![0f32; n * 10];
+        let lm = vec![0f32; n * 10];
         for p in 0..n {
             conf[p * 2 + 1] = 0.9;
         }
@@ -1011,7 +1287,7 @@ mod tests {
 
     #[test]
     fn retinaface_decode_filters_low_conf() {
-        let priors = generate_retinaface_priors();
+        let priors = generate_retinaface_priors(640);
         let n = priors.len();
         let loc = vec![0f32; n * 4];
         let mut conf = vec![0f32; n * 2];
@@ -1023,7 +1299,7 @@ mod tests {
 
     #[test]
     fn retinaface_decode_mismatched_buffers() {
-        let priors = generate_retinaface_priors();
+        let priors = generate_retinaface_priors(640);
         let dets = decode_retinaface(&[0.0], &[0.0, 0.0], &[0.0], &priors, 0.05, 640, 640);
         assert!(dets.is_empty());
     }
@@ -1039,7 +1315,7 @@ mod tests {
         }
         let mut session = crate::model_loader::load_session(&model).unwrap();
         let img = image::open(&photo).unwrap().to_rgb8();
-        let dets = run_yolo(&mut session, &img, 0.2, 0.45).unwrap();
+        let dets = run_yolo(&mut session, &img, 0.2, 0.45, 640).unwrap();
         eprintln!("smoke detections: {}", dets.len());
         for d in &dets {
             eprintln!(
@@ -1073,7 +1349,7 @@ mod tests {
         }
         let mut session = crate::model_loader::load_session(&model).unwrap();
         let img = image::open(&photo).unwrap().to_rgb8();
-        let dets = run_retinaface(&mut session, &img, 0.05, 0.45).unwrap();
+        let dets = run_retinaface(&mut session, &img, 0.05, 0.45, 640).unwrap();
         eprintln!("retinaface smoke detections: {}", dets.len());
         for d in dets.iter().take(5) {
             eprintln!(
@@ -1112,5 +1388,144 @@ mod tests {
         let state = pool.state.lock().unwrap();
         assert_eq!(state.live, 0);
         assert!(state.idle.is_empty());
+    }
+
+    /// Micro-benchmark of the ACTIVE per-face segmenter chain, to quantify
+    /// what a hypothetical batched inference (one ONNX run for N faces) would
+    /// actually save. Prints a per-call breakdown; run with `-- --ignored
+    /// --nocapture`. Requires the model + parade photo on disk.
+    #[test]
+    #[ignore = "requires selfie model + parade photo on disk"]
+    fn segmenter_cost_breakdown() {
+        use std::time::Instant;
+        let model = PathBuf::from("models_cache/model_quantized.onnx");
+        let photo = PathBuf::from("testassets/0_Parade_marchingband_1_1004.jpg");
+        if !model.exists() || !photo.exists() {
+            eprintln!("assets missing; skipping");
+            return;
+        }
+        let mut sess = crate::model_loader::load_session(&model).unwrap();
+        let img = image::open(&photo).unwrap().to_rgb8();
+        let (w, h) = img.dimensions();
+
+        // Realistic YOLO face crop on this photo (matches detector smoke).
+        let crop = crate::pipeline::crop_clamped(
+            &img,
+            Rect {
+                x0: 644.0,
+                y0: 193.0,
+                x1: 689.0,
+                y1: 235.0,
+            },
+        );
+        let big = crate::pipeline::crop_clamped(
+            &img,
+            Rect {
+                x0: 620.0,
+                y0: 170.0,
+                x1: 710.0,
+                y1: 260.0,
+            },
+        );
+
+        // Print session input shape → does the export support batch > 1?
+        eprintln!("frame {}x{}  crop {}x{}  big {}x{}", w, h, crop.width(), crop.height(), big.width(), big.height());
+
+        const RUNS: usize = 50;
+
+        // (1) Resize + CHW fill alone.
+        let c = crop.clone();
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(build_selfie_segmenter_input(&c));
+        }
+        let inp_avg = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+
+        // (2) Full per-face run (input + tensor + ONNX + resize-back + thr).
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(run_selfie_segmenter(&mut sess, &crop).unwrap());
+        }
+        let full_avg = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(run_selfie_segmenter(&mut sess, &big).unwrap());
+        }
+        let full_avg_big = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+
+        // (3) Dilate (the `rad` from a 45px-wide box → dilation 11px LInf).
+        let mask = run_selfie_segmenter(&mut sess, &crop).unwrap();
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(imageproc::morphology::dilate(
+                &mask,
+                imageproc::distance_transform::Norm::LInf,
+                11u8,
+            ));
+        }
+        let dilate_avg = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+
+        eprintln!(
+            "per-face: build_input={inp_avg:.1}ms  full_crop={full_avg:.1}ms  full_big={full_avg_big:.1}ms  dilate={dilate_avg:.2}ms"
+        );
+
+        // (4) Input build (already includes channel-split + CHW reordering), tensor
+        // construction, single-run inference, output extraction, resize-back
+        // + re-threshold. Prints shapes for single vs batch-2.
+        let input = build_selfie_segmenter_input(&crop);
+        let single_t = ort::value::Tensor::from_array((
+            vec![1i64, 3, SELFIE_SEG_INPUT as i64, SELFIE_SEG_INPUT as i64],
+            input.clone(),
+        ))
+        .unwrap();
+
+        // ONNX run alone: 1× vs 2× vs 4× — the ONLY part batching amortizes.
+        let mut t4 = input.clone();
+        for _ in 0..3 {
+            t4.extend_from_slice(&input);
+        }
+        let t4 = ort::value::Tensor::from_array((
+            vec![4i64, 3, SELFIE_SEG_INPUT as i64, SELFIE_SEG_INPUT as i64],
+            t4,
+        ))
+        .unwrap();
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(sess.run(ort::inputs![single_t.clone()]).unwrap());
+        }
+        let run1 = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            std::hint::black_box(sess.run(ort::inputs![t4.clone()]).unwrap());
+        }
+        let run4 = t0.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        eprintln!("session.run: 1-face={run1:.1}ms  4-faces-in-one={run4:.1}ms  (amortized/face={:.1}ms)", run4 / 4.0);
+        if let Ok(outs1) = sess.run(ort::inputs![single_t]) {
+            for (k, v) in outs1.iter() {
+                if let Ok((shape, _)) = v.try_extract_tensor::<f32>() {
+                    eprintln!("single output '{k}' shape={shape:?}");
+                }
+            }
+        }
+        let mut batched = input.clone();
+        batched.extend_from_slice(&input);
+        let tensor = ort::value::Tensor::from_array((
+            vec![2i64, 3, SELFIE_SEG_INPUT as i64, SELFIE_SEG_INPUT as i64],
+            batched,
+        ))
+        .unwrap();
+        match sess.run(ort::inputs![tensor]) {
+            Ok(o) => {
+                for (k, v) in o.iter() {
+                    if let Ok((shape, data)) = v.try_extract_tensor::<f32>() {
+                        eprintln!(
+                            "BATCH-N output '{k}' shape={shape:?} len={}",
+                            data.len()
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("BATCH-N: REJECTED (static [1,3,256,256] input): {e}"),
+        };
     }
 }
