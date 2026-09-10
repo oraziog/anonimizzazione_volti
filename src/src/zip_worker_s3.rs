@@ -17,10 +17,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
-use tokio::sync::{Mutex, Semaphore};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::config::S3Settings;
+use crate::db::{Db, S3JobRow};
 use crate::s3_client::S3Client;
 use crate::zip_worker::ZipProcessor;
 
@@ -50,24 +51,79 @@ pub struct S3JobStatus {
     pub error: Option<String>,
 }
 
-/// In-memory job registry. Not durable across restarts: the audit log object
-/// (logs bucket) is the source of truth for completed jobs.
-#[derive(Clone, Default)]
+/// Job registry persisted in SQLite (`s3_jobs` table), so `/status/:job_id`
+/// survives restarts. The durable trace remains the audit-log object in the
+/// logs bucket; this table is the queryable mirror + queue-intake registry.
+#[derive(Clone)]
 pub struct S3JobTracker {
-    jobs: Arc<Mutex<std::collections::HashMap<String, S3JobStatus>>>,
+    db: Db,
+}
+
+impl S3JobState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            S3JobState::Queued => "queued",
+            S3JobState::Running => "running",
+            S3JobState::Done => "done",
+            S3JobState::Failed => "failed",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "running" => S3JobState::Running,
+            "done" => S3JobState::Done,
+            "failed" => S3JobState::Failed,
+            _ => S3JobState::Queued,
+        }
+    }
+}
+
+fn row_to_status(row: S3JobRow) -> S3JobStatus {
+    S3JobStatus {
+        job_id: row.job_id,
+        input_key: row.input_key,
+        output_key: row.output_key,
+        state: S3JobState::from_str(&row.state),
+        processed_images: row.processed_images as usize,
+        error_count: row.error_count as usize,
+        output_size_bytes: row.output_size_bytes as u64,
+        etag: row.etag,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        error: row.error,
+    }
+}
+
+fn status_to_row(status: &S3JobStatus) -> S3JobRow {
+    S3JobRow {
+        job_id: status.job_id.clone(),
+        input_key: status.input_key.clone(),
+        output_key: status.output_key.clone(),
+        state: status.state.as_str().to_string(),
+        processed_images: status.processed_images as i64,
+        error_count: status.error_count as i64,
+        output_size_bytes: status.output_size_bytes as i64,
+        etag: status.etag.clone(),
+        started_at: status.started_at.clone(),
+        finished_at: status.finished_at.clone(),
+        error: status.error.clone(),
+    }
 }
 
 impl S3JobTracker {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(db: Db) -> Self {
+        Self { db }
     }
 
+    /// Inserts a queued job (idempotent: re-submitting the same id replaces it,
+    /// which is what queue redelivery wants).
     pub async fn submit(&self, job_id: String, input_key: String, output_key: String) {
-        let status = S3JobStatus {
+        let row = S3JobRow {
             job_id: job_id.clone(),
             input_key,
             output_key,
-            state: S3JobState::Queued,
+            state: S3JobState::Queued.as_str().to_string(),
             processed_images: 0,
             error_count: 0,
             output_size_bytes: 0,
@@ -76,18 +132,27 @@ impl S3JobTracker {
             finished_at: None,
             error: None,
         };
-        self.jobs.lock().await.insert(job_id, status);
+        if let Err(e) = self.db.job_upsert(&row).await {
+            tracing::warn!("could not persist queued job {job_id}: {e}");
+        }
     }
 
     pub async fn get(&self, job_id: &str) -> Option<S3JobStatus> {
-        self.jobs.lock().await.get(job_id).cloned()
+        match self.db.job_get(job_id).await {
+            Ok(Some(row)) => Some(row_to_status(row)),
+            _ => None,
+        }
     }
 
-    /// Applies `patch` under the lock (single-shot handler for Running/Done/
+    /// Applies `patch` read-modify-write (single-shot handler for Running/Done/
     /// Failed transitions).
     pub async fn patch(&self, job_id: &str, patch: impl FnOnce(&mut S3JobStatus)) {
-        if let Some(job) = self.jobs.lock().await.get_mut(job_id) {
-            patch(job);
+        let Some(mut status) = self.get(job_id).await else {
+            return;
+        };
+        patch(&mut status);
+        if let Err(e) = self.db.job_upsert(&status_to_row(&status)).await {
+            tracing::warn!("could not persist job {job_id} state: {e}");
         }
     }
 }
@@ -110,8 +175,34 @@ pub struct S3JobPolicy {
 }
 
 impl S3ZipWorker {
-    pub fn new(processor: ZipProcessor, s3: S3Client, settings: Arc<S3Settings>) -> Self {
-        let tracker = S3JobTracker::new();
+    /// Runs one queue-driven job end-to-end (download → anonymize → upload →
+    /// audit → webhook) with a caller-supplied `job_id` (deterministic, so a
+    /// redelivered message re-registers the same id instead of duplicating).
+    /// Returns `Ok(())` on completion; `Err` lets the queue consumer decide
+    /// whether to retry or move the message to a DLQ.
+    #[cfg_attr(
+        not(any(feature = "queue", feature = "rabbitmq")),
+        allow(dead_code)
+    )]
+    pub async fn run_queue_job(&self, msg: &QueueJobMessage, job_id: &str) -> Result<()> {
+        let output_key = validate_queue_message(msg)?;
+        self.tracker
+            .submit(job_id.to_string(), msg.input_key.clone(), output_key.clone())
+            .await;
+        self.run_job(
+            job_id,
+            &msg.input_key,
+            &output_key,
+            msg.callback_url.as_deref(),
+            S3JobPolicy {
+                delete_input_on_success: msg.delete_input_on_success,
+            },
+        )
+        .await
+    }
+
+    pub fn new(processor: ZipProcessor, s3: S3Client, settings: Arc<S3Settings>, db: Db) -> Self {
+        let tracker = S3JobTracker::new(db);
         Self {
             s3,
             processor,
@@ -428,6 +519,58 @@ pub fn webhook_host_allowed(settings: &S3Settings, url_str: &str) -> bool {
             allowed == &host
         }
     })
+}
+
+/// Message schema accepted by the async queue consumers (SQS feature `queue`,
+/// RabbitMQ feature `rabbitmq`). Mirrors the `POST /anonymize/s3` JSON body.
+#[cfg_attr(
+    not(any(feature = "queue", feature = "rabbitmq")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueJobMessage {
+    /// Object key of the archive in the input bucket (`.zip`/`.7z`/`.rar`).
+    pub input_key: String,
+    /// Optional destination key in the output bucket; defaults to
+    /// `elaborati/<input>_elaborato.zip`.
+    #[serde(default)]
+    pub output_key: Option<String>,
+    /// Optional completion webhook; the host must be on
+    /// `S3_WEBHOOK_ALLOWED_HOSTS` (anti-SSRF guard).
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Delete the input object after success (sweep-style consumers).
+    #[serde(default)]
+    pub delete_input_on_success: bool,
+}
+
+/// Validates the input/output keys of a queue message the same way the HTTP
+/// `/anonymize/s3` handler does (non-empty, no leading `/`).
+#[cfg_attr(
+    not(any(feature = "queue", feature = "rabbitmq")),
+    allow(dead_code)
+)]
+pub fn validate_queue_message(msg: &QueueJobMessage) -> Result<String> {
+    let input_key = msg.input_key.trim().to_string();
+    if input_key.is_empty() || input_key.starts_with('/') {
+        anyhow::bail!("input_key must be a non-empty object key");
+    }
+    let output_key = match msg.output_key.as_deref() {
+        Some(k) => {
+            let k = k.trim().to_string();
+            if k.is_empty() || k.starts_with('/') {
+                anyhow::bail!("output_key must be a non-empty object key");
+            }
+            k
+        }
+        None => default_output_key(&input_key),
+    };
+    if let Some(url) = msg.callback_url.as_deref() {
+        if url.trim().is_empty() {
+            anyhow::bail!("callback_url must not be empty");
+        }
+    }
+    Ok(output_key)
 }
 
 /// Default destination key for a submitted input: `elaborati/<stem>_elaborato.zip`

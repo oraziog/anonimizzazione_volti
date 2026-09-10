@@ -12,7 +12,8 @@ use image::{DynamicImage, Luma, Rgba};
 use crate::config::{AnonMode, Config, MaskSegmenter};
 use crate::db::CameraState;
 use crate::models::{
-    run_classifier, run_detector, run_selfie_segmenter, FaceDetection, Keypoints, ModelStore, Rect,
+    run_classifier, run_coco_persons, run_detector, run_selfie_segmenter, FaceDetection, Keypoints,
+    ModelStore, Rect,
 };
 use crate::roi::RoiPolygon;
 
@@ -700,6 +701,57 @@ pub fn process_image(
                 };
                 op.apply_masked(&mut rgba, &mask, sigma);
                 kept.push(det.clone());
+            }
+
+            // Head fallback: when the face detector found no faces (typical
+            // for pure-profile or heavily occluded shots), fall back to a
+            // COCO person detector and blur the upper fraction of each person
+            // box (the head region). This is a privacy-preserving last resort
+            // — blurring a head silhouette is safer than leaving a face
+            // unblurred.
+            if kept.is_empty() {
+                if let Some(pool) = store.coco_pool() {
+                    let mut coco = pool.acquire()?;
+                    let persons = run_coco_persons(
+                        &mut coco,
+                        img,
+                        cfg.yolo_conf_threshold_active,
+                        cfg.yolo_nms_iou,
+                        cfg.yolo_input_size,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("head-fallback person detection failed: {e}");
+                        Vec::new()
+                    });
+                    drop(coco);
+                    for p in &persons {
+                        let (cx, cy) = p.bbox.center();
+                        if let Some(roi) = &roi {
+                            if !roi.contains(cx as f64, cy as f64) {
+                                continue; // person outside ROI → skip
+                            }
+                        }
+                        // Upper `head_fallback_fraction` of the person box ≈
+                        // head region (conservative: includes shoulders).
+                        let head_h =
+                            (p.bbox.height() * cfg.head_fallback_fraction).clamp(8.0, f32::MAX);
+                        let head_rect = Rect {
+                            x0: p.bbox.x0,
+                            y0: p.bbox.y0,
+                            x1: p.bbox.x1,
+                            y1: (p.bbox.y0 + head_h).min(h as f32),
+                        };
+                        let mask = mask_from_ellipse(w, h, head_rect, 0.05);
+                        op.apply_masked(&mut rgba, &mask, sigma_for_box(head_rect.width()));
+                        kept.push(p.clone());
+                    }
+                    if !persons.is_empty() {
+                        tracing::debug!(
+                            "head-fallback blurred {} person head(s) (face detector found none)",
+                            persons.len()
+                        );
+                    }
+                }
             }
 
             Ok(ProcessOutcome {

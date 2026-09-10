@@ -412,19 +412,20 @@ fn clear_fp_crops(fp_dir: &Path) -> usize {
     removed
 }
 
-/// Deployed-classifier state, so the A/B baseline survives restarts.
+/// Last persisted classifier state (`DATA_DIR/classifier_state.json`), also
+/// read by the `GET /operator/classifier` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClassifierState {
-    active_onnx: String,
-    accuracy: f64,
-    updated_at: String,
+pub struct ClassifierState {
+    pub active_onnx: String,
+    pub accuracy: f64,
+    pub updated_at: String,
 }
 
 fn classifier_state_path(cfg: &Config) -> PathBuf {
     cfg.data_dir.join(crate::config::CLASSIFIER_STATE_FILENAME)
 }
 
-fn write_classifier_state(cfg: &Config, active_onnx: &Path, accuracy: f64) -> Result<()> {
+pub fn write_classifier_state(cfg: &Config, active_onnx: &Path, accuracy: f64) -> Result<()> {
     let st = ClassifierState {
         active_onnx: active_onnx.to_string_lossy().to_string(),
         accuracy,
@@ -436,7 +437,7 @@ fn write_classifier_state(cfg: &Config, active_onnx: &Path, accuracy: f64) -> Re
     Ok(())
 }
 
-fn read_classifier_state(cfg: &Config) -> Option<ClassifierState> {
+pub fn read_classifier_state(cfg: &Config) -> Option<ClassifierState> {
     let path = classifier_state_path(cfg);
     let raw = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&raw).ok()

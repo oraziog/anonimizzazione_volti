@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{anyhow, Result};
 
-use crate::config::{Config, DetectorMode};
+use crate::config::Config;
 
 // ─── Session pooling ─────────────────────────────────────────────────────────
 
@@ -158,18 +158,36 @@ pub struct ModelStore {
     /// Optional ACTIVE face-mask segmenter (MediaPipe Selfie, spec §4 —
     /// `MASK_SEGMENTER=mediapipe`). `None` keeps geometric masks.
     segmenter: Option<Arc<SessionPool>>,
+    /// Optional COCO person detector for the head-fallback path
+    /// (`HEAD_FALLBACK_ENABLED`): blurs the upper fraction of person boxes
+    /// when the face detector finds no faces.
+    coco: Option<Arc<SessionPool>>,
 }
 
 impl ModelStore {
+    /// Convenience constructor without a COCO pool (used by tests).
+    #[allow(dead_code)] // only called from #[cfg(test)] modules
     pub fn new(
         yolo: SessionPool,
         classifier: Option<SessionPool>,
         segmenter: Option<SessionPool>,
     ) -> Self {
+        Self::with_coco(yolo, classifier, segmenter, None)
+    }
+
+    /// Like [`ModelStore::new`] but also wires an optional COCO person
+    /// detector pool for the head-fallback path.
+    pub fn with_coco(
+        yolo: SessionPool,
+        classifier: Option<SessionPool>,
+        segmenter: Option<SessionPool>,
+        coco: Option<SessionPool>,
+    ) -> Self {
         Self {
             yolo: Arc::new(yolo),
             classifier: Arc::new(arc_swap::ArcSwap::from_pointee(classifier.map(Arc::new))),
             segmenter: segmenter.map(Arc::new),
+            coco: coco.map(Arc::new),
         }
     }
 
@@ -181,6 +199,11 @@ impl ModelStore {
     /// The ACTIVE face-mask segmenter pool, if `MASK_SEGMENTER=mediapipe`.
     pub fn segmenter_pool(&self) -> Option<Arc<SessionPool>> {
         self.segmenter.clone()
+    }
+
+    /// The COCO person-detector pool for the head-fallback path, if enabled.
+    pub fn coco_pool(&self) -> Option<Arc<SessionPool>> {
+        self.coco.clone()
     }
 
     /// Atomically swaps in a new classifier pool (pre-validated by the
@@ -331,164 +354,6 @@ pub fn iou(a: &Rect, b: &Rect) -> f32 {
     }
 }
 
-// ─── RetinaFace (mobilenetv1_0.25) preprocessing & output parsing ────────────
-
-/// BGR mean used by the reference RetinaFace inference code (opencv order).
-pub const RETINA_MEAN_BGR: [f32; 3] = [104.0, 117.0, 123.0];
-/// FPN anchor scales per stride (mobile0.25 config, spec WIDER: [[16,32],...]).
-const RETINA_MIN_SIZES: [[u32; 2]; 3] = [[16, 32], [64, 128], [256, 512]];
-const RETINA_STEPS: [u32; 3] = [8, 16, 32];
-const RETINA_VAR: [f32; 2] = [0.1, 0.2];
-
-/// Generates the normalized priors `[cx, cy, s_kx, s_ky]` (16800 at 640×640)
-/// for a given model input side, replicating `PriorBox.generate_anchors`.
-pub fn generate_retinaface_priors(input: u32) -> Vec<[f32; 4]> {
-    let perf_cells = RETINA_STEPS
-        .iter()
-        .map(|s| ((input / s) as usize) * ((input / s) as usize) * 2)
-        .sum();
-    let mut out = Vec::with_capacity(perf_cells);
-    for (k, step) in RETINA_STEPS.iter().enumerate() {
-        let cells = input / step;
-        for i in 0..cells {
-            for j in 0..cells {
-                let cx = (j as f32 + 0.5) * *step as f32 / input as f32;
-                let cy = (i as f32 + 0.5) * *step as f32 / input as f32;
-                for ms in RETINA_MIN_SIZES[k] {
-                    let size = ms as f32 / input as f32;
-                    out.push([cx, cy, size, size]);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Builds the CHW f32 input `[1,3,input,input]` for the ONNX RetinaFace
-/// models: stretch-resize to square, BGR channel order, `mean` subtracted.
-pub fn build_retinaface_input(
-    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-    input: u32,
-) -> Vec<f32> {
-    let n = input as usize;
-    let resized = image::imageops::resize(
-        img,
-        input,
-        input,
-        image::imageops::FilterType::Triangle,
-    );
-    let mut out = vec![0f32; 3 * n * n];
-    for (x, y, p) in resized.enumerate_pixels() {
-        let [r, g, b] = p.0;
-        let idx = y as usize * n + x as usize;
-        out[idx] = b as f32 - RETINA_MEAN_BGR[0];
-        out[n * n + idx] = g as f32 - RETINA_MEAN_BGR[1];
-        out[2 * n * n + idx] = r as f32 - RETINA_MEAN_BGR[2];
-    }
-    out
-}
-
-/// Decodes the three RetinaFace outputs (`loc`, `conf`, `landmarks`) using the
-/// shared 640 priors and maps boxes back to source pixels. Confidence is the
-/// already-softmaxed face score (`conf[:, 1]`); boxes are NMS-filtered.
-pub fn decode_retinaface(
-    loc: &[f32],
-    conf: &[f32],
-    landmarks: &[f32],
-    priors: &[[f32; 4]],
-    conf_threshold: f32,
-    src_w: u32,
-    src_h: u32,
-) -> Vec<FaceDetection> {
-    let n = priors.len();
-    let (w, h) = (src_w as f32, src_h as f32);
-    let mut dets: Vec<FaceDetection> = Vec::new();
-    if loc.len() < n * 4 || conf.len() < n * 2 || landmarks.len() < n * 10 {
-        return dets;
-    }
-    for (p, prior) in priors.iter().enumerate() {
-        let score = conf[p * 2 + 1];
-        if score < conf_threshold {
-            continue;
-        }
-        let (pcx, pcy, pw, ph) = (prior[0], prior[1], prior[2], prior[3]);
-        let cx = pcx + loc[p * 4] * RETINA_VAR[0] * pw;
-        let cy = pcy + loc[p * 4 + 1] * RETINA_VAR[0] * ph;
-        let bw = pw * (loc[p * 4 + 2] * RETINA_VAR[1]).exp();
-        let bh = ph * (loc[p * 4 + 3] * RETINA_VAR[1]).exp();
-        let x1 = ((cx - bw / 2.0) * w).clamp(0.0, w);
-        let y1 = ((cy - bh / 2.0) * h).clamp(0.0, h);
-        let x2 = ((cx + bw / 2.0) * w).clamp(0.0, w);
-        let y2 = ((cy + bh / 2.0) * h).clamp(0.0, h);
-        let bbox = Rect {
-            x0: x1.min(x2),
-            y0: y1.min(y2),
-            x1: x1.max(x2),
-            y1: y1.max(y2),
-        };
-        if bbox.width() < 1.0 || bbox.height() < 1.0 {
-            continue;
-        }
-        let mut kps = [(0.0f32, 0.0f32); 5];
-        for (k, slot) in kps.iter_mut().enumerate() {
-            let lx = pcx + landmarks[p * 10 + k * 2] * RETINA_VAR[0] * pw;
-            let ly = pcy + landmarks[p * 10 + k * 2 + 1] * RETINA_VAR[0] * ph;
-            *slot = ((lx * w).clamp(0.0, w), (ly * h).clamp(0.0, h));
-        }
-        dets.push(FaceDetection {
-            bbox,
-            confidence: score,
-            keypoints: Some(kps),
-        });
-    }
-    dets
-}
-
-/// Runs the RetinaFace ONNX model on one image and returns NMS-filtered
-/// detections in original-image coordinates (`session` exclusively owned).
-pub fn run_retinaface(
-    session: &mut ort::session::Session,
-    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-    conf_threshold: f32,
-    nms_iou: f32,
-    input: u32,
-) -> Result<Vec<FaceDetection>> {
-    let (w, h) = img.dimensions();
-    let input_data = build_retinaface_input(img, input);
-    let tensor = ort::value::Tensor::from_array((
-        vec![1i64, 3, input as i64, input as i64],
-        input_data,
-    ))
-    .map_err(|e| anyhow!("build RetinaFace input tensor: {e}"))?;
-    let outputs = session
-        .run(ort::inputs![tensor])
-        .map_err(|e| anyhow!("RetinaFace inference failed: {e}"))?;
-    if outputs.len() < 3 {
-        return Err(anyhow!("RetinaFace model returned fewer than 3 outputs"));
-    }
-    let mut tensors = Vec::new();
-    for i in 0..3 {
-        let (shape, data) = outputs[i]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow!("RetinaFace output {i} not f32 tensor: {e}"))?;
-        let dims: Vec<i64> = shape.iter().copied().collect();
-        tensors.push((dims, data));
-    }
-    let (loc, conf, lm) = (&tensors[0].1, &tensors[1].1, &tensors[2].1);
-    let n_priors = tensors[1].0.get(1).copied().unwrap_or(0);
-    if tensors[0].0.get(1).copied().unwrap_or(0) != n_priors
-        || tensors[2].0.get(1).copied().unwrap_or(0) != n_priors
-    {
-        return Err(anyhow!("RetinaFace outputs disagree on anchor count"));
-    }
-    if n_priors == 0 {
-        return Err(anyhow!("RetinaFace outputs carry no anchors"));
-    }
-    let priors = generate_retinaface_priors(input);
-    let mut dets = decode_retinaface(loc, conf, lm, &priors, conf_threshold, w, h);
-    dets = nms(dets, nms_iou);
-    Ok(dets)
-}
 
 // ─── Inference instrumentation (operator /operator/gpu) ─────────────────────
 
@@ -551,7 +416,7 @@ pub fn inference_stats() -> Vec<(&'static str, u64, f64)> {
         .collect()
 }
 
-/// Dispatches face detection to the configured detector (YOLO or RetinaFace).
+/// Dispatches face detection (YOLO).
 pub fn run_detector(
     cfg: &Config,
     store: &ModelStore,
@@ -560,22 +425,13 @@ pub fn run_detector(
 ) -> Result<Vec<FaceDetection>> {
     let started = std::time::Instant::now();
     let mut session = store.yolo.acquire()?;
-    let dets = match cfg.detector_mode {
-        DetectorMode::Yolo => run_yolo(
-            &mut session,
-            img,
-            conf_threshold,
-            cfg.yolo_nms_iou,
-            cfg.yolo_input_size,
-        ),
-        DetectorMode::RetinaFace => run_retinaface(
-            &mut session,
-            img,
-            conf_threshold,
-            cfg.yolo_nms_iou,
-            cfg.retinaface_input_size,
-        ),
-    }?;
+    let dets = run_yolo(
+        &mut session,
+        img,
+        conf_threshold,
+        cfg.yolo_nms_iou,
+        cfg.yolo_input_size,
+    )?;
     drop(session);
     record_inference(InferenceStage::Detector, started.elapsed());
     Ok(dets)
@@ -769,7 +625,7 @@ pub fn run_yolo(
             }
             // Classic transposed layout [1, C, anchors].
             [1, _c, _a] => {
-                raws.extend(parse_yolo_output_raw(&dims, data, conf_threshold, &lb));
+                raws.extend(parse_yolo_output_raw(&dims, data, conf_threshold));
             }
             _ => {
                 tracing::warn!(
@@ -814,7 +670,6 @@ fn parse_yolo_output_raw(
     shape: &[i64],
     data: &[f32],
     conf_threshold: f32,
-    src_params: &LetterboxParams,
 ) -> Vec<RawDet> {
     let mut out = Vec::new();
     if shape.len() != 3 || shape[0] != 1 {
@@ -851,17 +706,27 @@ fn parse_yolo_output_raw(
         if cw <= 0.0 || chh <= 0.0 {
             continue;
         }
+        // Keypoints are present only in pose-head models (`n_kp == 5`); for
+        // plain detect models (`[1, 4+n_cls, anchors]`) the 5 keypoint slots
+        // must NOT be read, or the channel index runs past the tensor.
+        // NOTE: boxes/keypoints are emitted in MODEL pixel coordinates
+        // (letterboxed input space); `run_yolo` applies the single inverse
+        // letterbox mapping afterwards — doing it here too would double-map.
         let mut kps = [(0.0f32, 0.0f32); 5];
         let mut all_visible = true;
-        for (k, slot) in kps.iter_mut().enumerate() {
-            let vis = col(4 + k * 3 + 2);
-            if vis <= 0.0 {
-                all_visible = false;
+        if n_kp == 5 {
+            for (k, slot) in kps.iter_mut().enumerate() {
+                let vis = col(4 + k * 3 + 2);
+                if vis <= 0.0 {
+                    all_visible = false;
+                }
+                *slot = (col(4 + k * 3), col(4 + k * 3 + 1));
             }
-            *slot = letterbox_to_src(col(4 + k * 3), col(4 + k * 3 + 1), src_params);
         }
-        let (x0, y0) = letterbox_to_src(cx - cw / 2.0, cy - chh / 2.0, src_params);
-        let (x1, y1) = letterbox_to_src(cx + cw / 2.0, cy + chh / 2.0, src_params);
+        let x0 = cx - cw / 2.0;
+        let y0 = cy - chh / 2.0;
+        let x1 = cx + cw / 2.0;
+        let y1 = cy + chh / 2.0;
         out.push(RawDet {
             x1: x0,
             y1: y0,
@@ -876,6 +741,84 @@ fn parse_yolo_output_raw(
         });
     }
     out
+}
+
+/// Runs a COCO person detector (e.g. Ultralytics `yolov8n.onnx`, output
+/// `[1, 4+n_cls, anchors]` with COCO class 0 = person) and returns the
+/// person boxes in original-image coordinates, filtered to class 0 and
+/// NMS'd. Used by the head-fallback path when the face detector finds no
+/// faces (blur the upper fraction of each person box).
+pub fn run_coco_persons(
+    session: &mut ort::session::Session,
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    conf_threshold: f32,
+    nms_iou: f32,
+    input: u32,
+) -> Result<Vec<FaceDetection>> {
+    const PERSON_CLASS: usize = 0;
+    let (w, h) = (img.width(), img.height());
+    let input_data = build_yolo_input(img, input);
+    let tensor = ort::value::Tensor::from_array((
+        vec![1i64, 3, input as i64, input as i64],
+        input_data,
+    ))
+    .map_err(|e| anyhow!("build COCO input tensor: {e}"))?;
+    let outputs = session
+        .run(ort::inputs![tensor])
+        .map_err(|e| anyhow!("COCO inference failed: {e}"))?;
+    if outputs.len() == 0 {
+        return Err(anyhow!("COCO model returned no outputs"));
+    }
+    let lb = letterbox_params(w, h, input);
+    let mut dets: Vec<FaceDetection> = Vec::new();
+    for value in outputs.values() {
+        let (shape, data) = value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("COCO output not f32 tensor: {e}"))?;
+        let dims: Vec<i64> = shape.iter().copied().collect();
+        // Accept [1, C, anchors] with C >= 5 (4 box + >=1 class).
+        if dims.len() != 3 || dims[0] != 1 {
+            tracing::warn!("COCO model returned an unrecognized output shape {dims:?}; ignoring it");
+            continue;
+        }
+        let channels = dims[1] as usize;
+        let anchors = dims[2] as usize;
+        if channels < 5 || anchors == 0 || data.len() < channels * anchors {
+            continue;
+        }
+        for a in 0..anchors {
+            let col = |ch: usize| data[ch * anchors + a];
+            let conf = col(4 + PERSON_CLASS);
+            if conf < conf_threshold {
+                continue;
+            }
+            let cx = col(0);
+            let cy = col(1);
+            let cw = col(2);
+            let chh = col(3);
+            if cw <= 0.0 || chh <= 0.0 {
+                continue;
+            }
+            let (x0, y0) = letterbox_to_src(cx - cw / 2.0, cy - chh / 2.0, &lb);
+            let (x1, y1) = letterbox_to_src(cx + cw / 2.0, cy + chh / 2.0, &lb);
+            let bbox = Rect {
+                x0: x0.min(x1).clamp(0.0, w as f32),
+                y0: y0.min(y1).clamp(0.0, h as f32),
+                x1: x0.max(x1).clamp(0.0, w as f32),
+                y1: y0.max(y1).clamp(0.0, h as f32),
+            };
+            if bbox.width() < 1.0 || bbox.height() < 1.0 {
+                continue;
+            }
+            dets.push(FaceDetection {
+                bbox,
+                confidence: conf,
+                keypoints: None,
+            });
+        }
+    }
+    dets = nms(dets, nms_iou);
+    Ok(dets)
 }
 
 /// Runs the binary classifier on a crop. Returns `(p_falso_positivo,
@@ -1118,8 +1061,7 @@ mod tests {
         }
         data[19] = 0.7; // class score (single class)
 
-        let lb = letterbox_params(640, 640, 640);
-        let raws = parse_yolo_output_raw(&shape, &data, 0.20, &lb);
+        let raws = parse_yolo_output_raw(&shape, &data, 0.20);
         assert_eq!(raws.len(), 1);
         assert!((raws[0].conf - 0.7).abs() < 1e-6);
         let kps = raws[0].keypoints.unwrap();
@@ -1130,9 +1072,8 @@ mod tests {
 
     #[test]
     fn parse_raw_rejects_bad_shapes() {
-        let lb = letterbox_params(640, 640, 640);
-        assert!(parse_yolo_output_raw(&[1, 5], &[], 0.2, &lb).is_empty());
-        assert!(parse_yolo_output_raw(&[2, 5, 10], &[], 0.2, &lb).is_empty());
+        assert!(parse_yolo_output_raw(&[1, 5], &[], 0.2).is_empty());
+        assert!(parse_yolo_output_raw(&[2, 5, 10], &[], 0.2).is_empty());
     }
 
     #[test]
@@ -1219,92 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn retinaface_priors_structure() {
-        let priors = generate_retinaface_priors(640);
-        assert_eq!(priors.len(), 16_800);
-        // Level 0 (stride 8): cell (0,0), first size 16 → 640×640 normalized.
-        let p0 = priors[0];
-        assert!((p0[0] - (0.5 * 8.0 / 640.0)).abs() < 1e-6);
-        assert!((p0[1] - (0.5 * 8.0 / 640.0)).abs() < 1e-6);
-        assert!((p0[2] - 16.0 / 640.0).abs() < 1e-6);
-        assert!((p0[3] - 16.0 / 640.0).abs() < 1e-6);
-        // Second prior of the same cell → size 32.
-        let p1 = priors[1];
-        assert!((p1[2] - 32.0 / 640.0).abs() < 1e-6);
-        // Last prior of level 0 must be cell (79,79) with size 32.
-        let last_l0 = priors[2 * 80 * 80 - 1];
-        assert!((last_l0[0] - (79.5 * 8.0 / 640.0)).abs() < 1e-4);
-        assert!((last_l0[2] - 32.0 / 640.0).abs() < 1e-6);
-        // Level boundaries: priors are grouped per level.
-        let first_l1 = priors[2 * 80 * 80];
-        assert!((first_l1[0] - (0.5 * 16.0 / 640.0)).abs() < 1e-6);
-        assert!((first_l1[2] - 64.0 / 640.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn retinaface_priors_scales_with_input() {
-        // 512×512 → cells 64/32/16, two anchors per cell.
-        let priors = generate_retinaface_priors(512);
-        assert_eq!(priors.len(), 2 * (64 * 64 + 32 * 32 + 16 * 16));
-        let p0 = priors[0];
-        assert!((p0[0] - (0.5 * 8.0 / 512.0)).abs() < 1e-6);
-        assert!((p0[2] - 16.0 / 512.0).abs() < 1e-6);
-        let p_last = priors[2 * 64 * 64 - 1];
-        assert!((p_last[0] - (63.5 * 8.0 / 512.0)).abs() < 1e-4);
-    }
-
-    #[test]
-    fn retinaface_input_layout_bgr_mean() {
-        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-            image::ImageBuffer::from_pixel(4, 4, image::Rgb([10, 20, 30]));
-        let input = build_retinaface_input(&img, 640);
-        assert_eq!(input.len(), 3 * 640 * 640);
-        // BGR order with mean subtraction at the top-left pixel.
-        assert!((input[0] - (30.0 - 104.0)).abs() < 1e-5);
-        assert!((input[640 * 640] - (20.0 - 117.0)).abs() < 1e-5);
-        assert!((input[2 * 640 * 640] - (10.0 - 123.0)).abs() < 1e-5);
-    }
-
-    #[test]
-    fn retinaface_decode_synthetic() {
-        let priors = generate_retinaface_priors(640);
-        let n = priors.len();
-        let loc = vec![0f32; n * 4];
-        let mut conf = vec![0f32; n * 2];
-        let lm = vec![0f32; n * 10];
-        for p in 0..n {
-            conf[p * 2 + 1] = 0.9;
-        }
-        // Zero loc → boxes equal to the prior box centered at the prior center.
-        let dets = decode_retinaface(&loc, &conf, &lm, &priors, 0.05, 640, 640);
-        assert_eq!(dets.len(), n);
-        let d = &dets[0]; // prior: center (4,4), size 16×16
-        assert!((d.bbox.x0 - 0.0).abs() < 1.0); // (4-8) → clamped at 0
-        assert!((d.bbox.y1 - 12.0).abs() < 1.0); // (4+8)
-        assert!((d.confidence - 0.9).abs() < 1e-6);
-        assert!(d.keypoints.is_some());
-    }
-
-    #[test]
-    fn retinaface_decode_filters_low_conf() {
-        let priors = generate_retinaface_priors(640);
-        let n = priors.len();
-        let loc = vec![0f32; n * 4];
-        let mut conf = vec![0f32; n * 2];
-        let lm = vec![0f32; n * 10];
-        conf.fill(0.01);
-        let dets = decode_retinaface(&loc, &conf, &lm, &priors, 0.05, 640, 640);
-        assert!(dets.is_empty());
-    }
-
-    #[test]
-    fn retinaface_decode_mismatched_buffers() {
-        let priors = generate_retinaface_priors(640);
-        let dets = decode_retinaface(&[0.0], &[0.0, 0.0], &[0.0], &priors, 0.05, 640, 640);
-        assert!(dets.is_empty());
-    }
-
-    #[test]
     #[ignore = "requires the model + sample photo under .test-assets"]
     fn real_face_model_smoke() {
         let model = std::path::PathBuf::from(".test-assets/yolov8n-face.onnx");
@@ -1339,41 +1194,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the model + sample photo on disk"]
-    fn real_retinaface_model_smoke() {
-        let model = std::path::PathBuf::from("models_cache/retinaface_mv1_0.25.onnx");
+    #[ignore = "requires the COCO model + parade photo on disk"]
+    fn coco_persons_smoke() {
+        let model = std::path::PathBuf::from("models_cache/yolov8n-coco.onnx");
         let photo = std::path::PathBuf::from("testassets/0_Parade_marchingband_1_1004.jpg");
         if !model.exists() || !photo.exists() {
-            eprintln!("retinaface smoke assets missing; skipping");
+            eprintln!("coco smoke assets missing; skipping");
             return;
         }
         let mut session = crate::model_loader::load_session(&model).unwrap();
         let img = image::open(&photo).unwrap().to_rgb8();
-        let dets = run_retinaface(&mut session, &img, 0.05, 0.45, 640).unwrap();
-        eprintln!("retinaface smoke detections: {}", dets.len());
-        for d in dets.iter().take(5) {
+        let dets = run_coco_persons(&mut session, &img, 0.25, 0.45, 640).unwrap();
+        eprintln!("coco person detections: {}", dets.len());
+        for d in &dets {
             eprintln!(
-                "  conf={:.4} bbox=({:.2},{:.2},{:.2},{:.2})",
+                "  conf={:.3} bbox=({:.0},{:.0},{:.0},{:.0})",
                 d.confidence, d.bbox.x0, d.bbox.y0, d.bbox.x1, d.bbox.y1
             );
         }
         assert!(
             !dets.is_empty(),
-            "expected at least one face in the parade photo"
-        );
-        // Reference (OpenCV-CUBIC) top detection at conf>0.05 iou<=0.45:
-        // bbox (644.97,193.63)-(689.16,234.76) @ 0.9866
-        let top = &dets[0];
-        assert!(
-            (top.confidence - 0.9866).abs() < 0.03,
-            "top conf {}",
-            top.confidence
-        );
-        assert!(
-            (top.bbox.x0 - 644.97).abs() < 12.0 && (top.bbox.x1 - 689.16).abs() < 12.0,
-            "top box x={},{}",
-            top.bbox.x0,
-            top.bbox.x1
+            "expected at least one person in the parade photo"
         );
     }
 

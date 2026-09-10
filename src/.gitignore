@@ -34,3 +34,11 @@ testfp/
 # Temp
 .freebuff/
 headers.txt
+
+# Benchmark & evaluation artifacts (generated)
+/bench_clf*.out
+attivo_*.zip
+attivo_out*.zip
+
+# Generated ONNX datasets/venvs (never commit)
+.venv-train/

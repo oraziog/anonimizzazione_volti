@@ -49,6 +49,12 @@ in-flight workers finish on the old sessions.
   errors blur anyway), and the blur region is the **convex hull of the 5 facial
   keypoints** (ellipse fallback when the loaded model exports no landmarks),
   masked + gaussian-softened, margin `BLUR_HULL_MARGIN_PCT`.
+- **Head fallback** (`HEAD_FALLBACK_ENABLED`) — when the face detector finds no
+  faces in an ACTIVE frame (typical for pure-profile or heavily occluded
+  shots), a COCO person detector runs and the **upper `HEAD_FALLBACK_FRACTION`
+  of every person box** (the head region) is blurred. It is a
+  privacy-preserving last resort: blurring a head silhouette is safer than
+  leaving a face unblurred.
 
 ### ROI extraction (spec §5)
 
@@ -76,9 +82,13 @@ export $(grep -v '^#' .env | xargs)   # or use your preferred loader
 cargo run --release
 ```
 
-The default YOLO model (`yolov8n-face.onnx`, public WIDERFace-trained model
-with 5 landmarks) is downloaded automatically at startup to `MODEL_CACHE_DIR`
-and verified against `MODEL_YOLO_SHA256`. **Startup fails fast** if a
+The YOLO face model is downloaded automatically at startup to
+`MODEL_CACHE_DIR` and verified against `MODEL_YOLO_SHA256` (default:
+`yolov8m-face-lindevs.onnx`, a WIDERFace-trained model with hard-set mAP
+≈84.6 vs ≈79.4 for the nano — measurably better recall on profiles and small
+faces; `YOLO_MODEL_URL` swaps in any YOLOv8-Face export). When
+`HEAD_FALLBACK_ENABLED=true`, the COCO person detector (`COCO_MODEL_URL`) is
+also downloaded for the head-fallback path. **Startup fails fast** if a
 configured model cannot be downloaded or loaded (spec §3).
 
 ### Docker (recommended — full service with nightly retraining)
@@ -217,6 +227,11 @@ curl -H "X-Operator-Key: $KEY" -X POST \
 # Last nightly-retraining audit record (JSON, written by the retraining job):
 curl -H "X-Operator-Key: $KEY" http://localhost:8080/operator/retrain-audit
 
+# Binary-classifier state (ACTIVE second check): loaded=true means the second
+# gate is running; also reports the configured URL, persisted accuracy + last
+# swap (classifier_state.json) and the live classifier inference counters:
+curl -H "X-Operator-Key: $KEY" http://localhost:8080/operator/classifier
+
 # Inference backend status: configured EP, device id, memory limit, TF32/FP16
 # flags, measured per-stage inference stats and best-effort nvidia-smi name:
 curl -H "X-Operator-Key: $KEY" http://localhost:8080/operator/gpu
@@ -240,51 +255,262 @@ Docker build arg `FEATURES=retraining,s3`). Without it the routes below do
 not exist; with `S3_ENABLED` unset/false the service starts but skips the S3
 backend entirely.
 
-Quick start with MinIO (creates the service + 3 private buckets):
+#### Quick start with MinIO
+
+The shipped compose file creates the service + 3 private buckets:
 
 ```bash
 docker compose -f docker-compose.minio.yml up -d --build
-./scripts/s3_tools.sh upload frame.zip camera_001.zip          # -> s3://anonimizzazione-input/camera_001.zip
+./scripts/s3_tools.sh upload frame.zip camera_001.zip   # -> s3://anonimizzazione-input/camera_001.zip
 curl -X POST localhost:8080/anonymize/s3 \
      -H 'Content-Type: application/json' \
      -d '{"input_key":"camera_001.zip"}'
-curl localhost:8080/status/:JOB_ID                             # queued/running/done/failed
+curl localhost:8080/status/<JOB_ID>                     # queued/running/done/failed
 ```
 
-Flow per job: the worker downloads the archive from the input bucket to a
-scratch dir under `DATA_DIR`, processes it with the **same** `ZipProcessor`
-as the HTTP path (per-image `MAX_CONCURRENT_IMAGES` still applies), uploads
-`elaborati/<stem>_elaborato.zip` to the output bucket, writes a JSON audit
-log to the logs bucket (`logs/<job_id>.json`) and — if an allowlisted
-completion host is configured — POSTs a webhook carrying the job id, output
-key and a 1 h **presigned GET URL**. On failure the input archive is moved to
-`errori/<key>` (parking it, so a sweep never re-picks it).
+#### Bucket layout
 
-Endpoints (registered only when the backend is enabled):
+Three fixed logical buckets (names configurable):
 
-- `POST /anonymize/s3` — body `{"input_key":"...", "output_key":"...?", "callback_url":"...?"}`.
+| Bucket | Contenuto |
+| --- | --- |
+| `anonimizzazione-input` | archives uploaded by cameras/clients (`.zip`/`.7z`/`.rar`) |
+| `anonimizzazione-output` | anonymized archives under `elaborati/` (`<stem>_elaborato.zip`) |
+| `anonimizzazione-logs` | one JSON audit log per job, `logs/<job_id>.json` |
+
+On failure the input object is **moved** to `errori/<key>` inside the input
+bucket (parking it, so a sweep never re-picks it). Buckets are private; do
+not enable anonymous access (`mc policy set public`) on them.
+
+#### Flow per job
+
+The worker downloads the archive from the input bucket to a scratch dir
+under `DATA_DIR`, processes it with the **same** `ZipProcessor` as the HTTP
+path (per-image `MAX_CONCURRENT_IMAGES` still applies), uploads
+`elaborati/<stem>_elaborato.zip` to the output bucket, writes the JSON audit
+log to the logs bucket and — if an allowlisted completion host is configured
+— POSTs a webhook carrying the job id, output key and a 1 h **presigned GET
+URL** (streamed download, never buffered in RAM). Concurrency across jobs is
+bounded by `S3_MAX_CONCURRENT_JOBS` (a semaphore); the per-image semaphore
+still applies inside each job, so S3 tasks never oversubscribe the GPU/CPU
+pool.
+
+#### Endpoints
+
+Registered only when the backend is enabled:
+
+- `POST /anonymize/s3` — body
+  `{"input_key":"...", "output_key":"...?", "callback_url":"...?"}`.
   Enforces the webhook anti-SSRF allowlist (400 if the callback host is not
-  listed), `404` if the input object does not exist, `202 Accepted` otherwise
-  with `job_id`, `input`, `output` and `check_status_at`. The input object is
-  **not** deleted (delete policy is only enabled on the operator sweep).
-- `GET /status/:job_id` — in-memory job state and progress counters.
+  listed), `404` if the input object does not exist, `202 Accepted` otherwise.
+  The input object is **not** deleted (delete policy is only enabled on the
+  operator sweep). Response:
+
+  ```json
+  {
+    "status": "accepted",
+    "job_id": "<uuid>",
+    "input": "s3://anonimizzazione-input/camera_001.zip",
+    "output": "s3://anonimizzazione-output/elaborati/camera_001_elaborato.zip",
+    "check_status_at": "/status/<job_id>"
+  }
+  ```
+
+- `GET /status/:job_id` — in-memory job state and progress counters:
+
+  ```json
+  {
+    "job_id": "<uuid>",
+    "input_key": "camera_001.zip",
+    "output_key": "elaborati/camera_001_elaborato.zip",
+    "state": "queued | running | done | failed",
+    "processed_images": 123,
+    "error_count": 0,
+    "output_size_bytes": 1048576,
+    "etag": "\"<output-etag>\"",
+    "started_at": "2026-09-09T10:00:00Z",
+    "finished_at": "2026-09-09T10:02:00Z",
+    "error": null
+  }
+  ```
+
+  State is in-memory: after a restart the durable trace is the audit log
+  object in the logs bucket (`logs/<job_id>.json`).
+
 - `POST /operator/s3/sweep` (gated by `X-Operator-Key`) — batch backfill:
   body `{"prefix":"", "max_files":50, "delete_input_on_success":true}` lists
   the input bucket and submits every `.zip`/`.7z`/`.rar` not under `errori/`
-  as a tracked job (metadata per submitted object is echoed back). Real
-  parallelism stays bounded by `S3_MAX_CONCURRENT_JOBS`.
+  as a tracked job (listing metadata per submitted object is echoed back).
+  Real parallelism stays bounded by `S3_MAX_CONCURRENT_JOBS`.
 
-Config (see `.env.example`): `S3_ENABLED`, `S3_ENDPOINT` (empty → real AWS,
-virtual-hosted; set → path-style by default), `S3_FORCE_PATH_STYLE`,
-`S3_BUCKET_INPUT/OUTPUT/LOGS`, `S3_MAX_CONCURRENT_JOBS` (default 2),
-`S3_WEBHOOK_ALLOWED_HOSTS`. Storage credentials come from the standard AWS
-chain: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
+#### Completion webhook
+
+When `callback_url` is sent at submit time **and** its host is on
+`S3_WEBHOOK_ALLOWED_HOSTS`, the worker POSTs on completion:
+
+```json
+{
+  "event": "processing_completed",
+  "job_id": "<uuid>",
+  "input": "camera_001.zip",
+  "output": "elaborati/camera_001_elaborato.zip",
+  "etag": "\"<output-etag>\"",
+  "processed_images": 123,
+  "error_count": 0,
+  "output_size": 1048576,
+  "download_url": "https://<endpoint>/anonimizzazione-output/...?X-Amz-..."
+}
+```
+
+`download_url` is a 1 h presigned GET URL for the anonymized archive.
+
+#### Configuration (env vars)
+
+| Variabile | Default | Descrizione |
+| --- | --- | --- |
+| `S3_ENABLED` | `false` | Attiva il backend (route registrate solo se `true`) |
+| `S3_ENDPOINT` | *(vuoto)* | URL dell'archivio S3-compatibile; **vuoto = AWS reale** (virtual-hosted), **impostato** (es. `http://minio:9000`) = path-style di default |
+| `S3_FORCE_PATH_STYLE` | `true` se `S3_ENDPOINT` impostato, altrimenti `false` | Forza l'addressing path-style dei bucket |
+| `S3_BUCKET_INPUT` | `anonimizzazione-input` | Bucket di ingresso (upload delle telecamere) |
+| `S3_BUCKET_OUTPUT` | `anonimizzazione-output` | Bucket di uscita (archivi anonimizzati) |
+| `S3_BUCKET_LOGS` | `anonimizzazione-logs` | Bucket dei log di audit per job |
+| `S3_MAX_CONCURRENT_JOBS` | `2` | Job S3 paralleli (ogni job rispetta comunque `MAX_CONCURRENT_IMAGES`) |
+| `S3_WEBHOOK_ALLOWED_HOSTS` | *(vuoto)* | Allowlist `host[:port]` separata da virgole per la webhook; vuoto = webhook rifiutata al submit (anti-SSRF) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Credenziali dalla chain standard AWS (MinIO: access/secret key del tenant) |
+
+Esempio MinIO (vedi anche `docker-compose.minio.yml`):
+
+```bash
+S3_ENABLED=true
+S3_ENDPOINT=http://minio:9000
+S3_BUCKET_INPUT=anonimizzazione-input
+S3_BUCKET_OUTPUT=anonimizzazione-output
+S3_BUCKET_LOGS=anonimizzazione-logs
+S3_MAX_CONCURRENT_JOBS=2
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+AWS_REGION=us-east-1
+```
+
+Esempio AWS S3 (nessun endpoint → virtual-hosted):
+
+```bash
+S3_ENABLED=true
+# S3_ENDPOINT non impostato
+S3_BUCKET_INPUT=myco-cam-input
+S3_BUCKET_OUTPUT=myco-cam-output
+S3_BUCKET_LOGS=myco-cam-logs
+S3_WEBHOOK_ALLOWED_HOSTS=notifiche.internal:8443
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=eu-central-1
+```
+
+Il binario deve essere compilato con la feature `s3` (Docker: build arg
+`FEATURES=retraining,s3`; vedere `docker-compose.minio.yml`).
 
 > **Security notes.** Buckets are private (no anonymous `mc policy set public`
 > in the shipped compose file). Completion webhooks are disabled unless
 > `S3_WEBHOOK_ALLOWED_HOSTS` names the host — never allow arbitrary webhook
-> callbacks from the internet. Job state is in memory: after a restart the
-> durable trace is the audit log in the logs bucket.
+> callbacks from the internet. Job state is **persisted in SQLite** (table
+> `s3_jobs`): `/status/:job_id` survives restarts; the durable trace is the
+> audit log in the logs bucket.
+
+#### Integrazione client (pattern asincrono)
+
+Il flusso consigliato per integrare l'anonimizzazione nei flussi di lavoro dei
+clienti è asincrono: si carica l'archivio in un bucket, si chiama
+`POST /anonymize/s3` (risposta `202` con `job_id`), e si attende il
+completamento tramite **webhook** o **polling** su `GET /status/:job_id`.
+
+```python
+# Pseudocodice lato cliente
+import boto3, requests, time
+
+s3 = boto3.client("s3")
+base = "http://anonimizzazione.internal:8080"
+
+# 1) Carica l'archivio nel bucket di input (streaming, mai in RAM)
+s3.upload_file("frames_2024.zip", "anonimizzazione-input", "cliente/frames_2024.zip")
+
+# 2) Sottoponi il job (input_key = chiave oggetto nel bucket di input)
+r = requests.post(f"{base}/anonymize/s3", json={
+    "input_key": "cliente/frames_2024.zip",
+    # "output_key": "elaborati/frames_2024_elaborato.zip",  # opzionale
+    # "callback_url": "https://cliente.internal/hooks/anonimizzazione",  # opzionale (allowlist!)
+})
+assert r.status_code == 202
+job_id = r.json()["job_id"]
+
+# 3a) Attendi il completamento via webhook (host deve essere in
+#     S3_WEBHOOK_ALLOWED_HOSTS) — ricevi `processing_completed` con
+#     download_url presigned (1 h) sull'archivio anonimizzato.
+
+# 3b) Oppure polling sullo stato:
+while True:
+    st = requests.get(f"{base}/status/{job_id}").json()
+    if st["state"] in ("done", "failed"):
+        break
+    time.sleep(5)
+
+# 4) Scarica il risultato con l'URL presigned (o direttamente dal bucket output)
+if st["state"] == "done":
+    url = requests.get(f"{base}/status/{job_id}").json()  # include etag/output_size
+    print("completato:", st["output_key"], st["processed_images"], "immagini")
+```
+
+Per volumi maggiori e scala orizzontale il servizio può consumare da una **coda**
+(SQS o RabbitMQ, sotto).
+
+#### Code asincrone (feature `queue` = SQS, `rabbitmq` = RabbitMQ)
+
+Oltre all'API REST, il servizio può ricevere job da una coda di messaggi: il
+consumer condivide lo **stesso** `S3ZipWorker` (bucket, semafori, pipeline), quindi
+la concorrenza resta limitata anche sommando ingressi HTTP + S3 + code. Il
+messaggio ha la stessa forma del body di `/anonymize/s3`:
+
+```json
+{"input_key": "cliente/frames_2024.zip", "output_key": "elaborati/frames_2024_elaborato.zip", "callback_url": "https://cliente.internal/hooks/anonimizzazione"}
+```
+
+**SQS (feature `queue`, env `SQS_ENABLED=true`)** — long-polling sulla coda
+(`SQS_QUEUE_URL`); successo → messaggio cancellato (ack); errore → il messaggio
+resta e viene rideliverato dopo il visibility timeout (`SQS_VISIBILITY_TIMEOUT_SECONDS`).
+Il loop **non esce mai**: gli errori transitori (throttling, 5xx) vengono
+ritentati con backoff esponenziale (`SQS_POLL_INTERVAL_SECS` × 2ⁿ, cap
+`SQS_MAX_BACKOFF_SECS`) e il client AWS viene ricostruito dopo un outage
+prolungato. All'avvio il consumer **crea automaticamente la DLQ**
+(`{queue}-dlq`) e imposta la redrive policy con
+`maxReceiveCount = SQS_MAX_RECEIVE_ATTEMPTS` — i messaggi velenosi finiscono
+in DLQ invece di girare all'infinito.
+
+```bash
+aws sqs send-message --queue-url https://sqs.eu-central-1.amazonaws.com/123/anonimizzazione-jobs \
+  --message-body '{"input_key":"cliente/frames_2024.zip"}'
+```
+
+**RabbitMQ (feature `rabbitmq`, env `RABBITMQ_ENABLED=true`)** — consumer
+manual-ack con ack su successo, **retry esponenziale** (ripubblicazione su una
+coda di retry con TTL per-messaggio, base `RABBITMQ_RETRY_BACKOFF_SECS` × 2ⁿ,
+cap `RABBITMQ_MAX_BACKOFF_SECS`) e **DLQ** dopo `RABBITMQ_MAX_RETRIES` tentativi.
+Topologia dichiarata all'avvio (idempotente): `anonimizzazione-jobs`,
+`anonimizzazione-jobs-retry`, `anonimizzazione-jobs-dlq`.
+
+```bash
+# publish con rabbitmqadmin / amqp client qualsiasi:
+# exchange: "", routing key: anonimizzazione-jobs
+# body: {"input_key":"cliente/frames_2024.zip"}
+```
+
+**Metriche live.** Ogni consumer pubblica contatori (ricevuti / completati /
+falliti / in DLQ / profondità DLQ) consultabili dall'operatore su
+`GET /operator/queues` (gated da `X-Operator-Key`), utile per monitorare code
+SQS e RabbitMQ senza accesso alla console del broker.
+
+**Nota sui job in coda.** Il `job_id` usato dal tracker è il `message_id` del
+messaggio (SQS) o dell'header `message_id` (RabbitMQ), quindi una ridelivery
+ri-registra lo stesso id invece di duplicare il job; lo stato resta visibile su
+`GET /status/:job_id` come per i job HTTP/S3.
 
 ## Configuration
 
@@ -336,6 +562,15 @@ Key groups:
   Credenziali dal chain `AWS_*`. Richiede il binario compilato con la feature
   `s3` (`Dockerfile`: build arg `FEATURES=retraining,s3`). Vedere
   "S3 storage backend" sopra.
+- **Code asincrone** — feature `queue` (SQS) e `rabbitmq` (RabbitMQ),
+  entrambe implicano `s3` + `S3_ENABLED=true`. SQS: `SQS_ENABLED`,
+  `SQS_QUEUE_URL` (obbligatoria), `SQS_REGION`, `SQS_MAX_MESSAGES` (1–10),
+  `SQS_WAIT_SECONDS` (0–20), `SQS_VISIBILITY_TIMEOUT_SECONDS` (900),
+  `SQS_POLL_INTERVAL_SECS` (5), `SQS_MAX_RECEIVE_ATTEMPTS` (5). RabbitMQ:
+  `RABBITMQ_ENABLED`, `RABBITMQ_URL`, `RABBITMQ_QUEUE`,
+  `RABBITMQ_DLQ`, `RABBITMQ_PREFETCH` (4), `RABBITMQ_MAX_RETRIES` (3),
+  `RABBITMQ_RETRY_BACKOFF_SECS` (5), `RABBITMQ_MAX_BACKOFF_SECS` (300).
+  Vedere "Code asincrone" sopra.
 - **Retention (STORE outputs)** — the anonymized `<input>_elaborato.zip`
   files accumulating in `DATA_DIR` are pruned by a background loop:
   `RETENTION_MAX_DAYS` (age rule), `RETENTION_MAX_GB` (size rule, oldest
@@ -521,9 +756,15 @@ poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
 6. **S3 storage backend** — implemented behind the `s3` cargo feature
    (see "S3 backend" section above): async job intake from a bucket, output
    to a bucket, audit logs, presigned download URLs, allowlisted completion
-   webhooks, operator batch sweep. Job status in memory; the durable trace is
-   the audit log object. Not enabled by default (compile-time feature, like
-   `retraining`/`cuda`).
+   webhooks, operator batch sweep. Job status is **persisted in SQLite**
+   (`s3_jobs` table); the durable trace is the audit log object. Not enabled
+   by default (compile-time feature, like `retraining`/`cuda`).
+7. **Queue intake** — features `queue` (SQS) and `rabbitmq` (RabbitMQ)
+   consume `{input_key, ...}` messages and drive them through the shared S3
+   worker: ack on success, redelivery/retry on failure, DLQ after max
+   attempts (SQS auto-created redrive policy / RabbitMQ DLQ), resilient poll
+   loop with exponential backoff, live metrics on `/operator/queues`. See
+   "Code asincrone" above.
 
 ## Layout note
 

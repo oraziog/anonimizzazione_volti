@@ -32,8 +32,14 @@ mod models;
 mod pipeline;
 mod retention;
 mod roi;
+#[cfg(any(feature = "queue", feature = "rabbitmq"))]
+mod queue_metrics;
 #[cfg(feature = "s3")]
 mod s3_client;
+#[cfg(feature = "queue")]
+mod queue_sqs;
+#[cfg(feature = "rabbitmq")]
+mod queue_rabbitmq;
 #[cfg(feature = "retraining")]
 mod training;
 mod zip_worker;
@@ -58,7 +64,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use crate::config::{Config, DetectorMode, MaskSegmenter};
+use crate::config::{Config, MaskSegmenter};
 use crate::db::{Camera, Db};
 use crate::model_loader::{ensure_model, ExecutionSettings};
 use crate::models::{ModelStore, SessionPool};
@@ -81,6 +87,9 @@ struct AppState {
     /// registered exactly then.
     #[cfg(feature = "s3")]
     s3: Option<S3ZipWorker>,
+    /// Live counters of the async queue consumers (`/operator/queues`).
+    #[cfg(any(feature = "queue", feature = "rabbitmq"))]
+    queue_metrics: queue_metrics::QueueMetricsRegistry,
 }
 
 #[cfg(feature = "s3")]
@@ -179,25 +188,15 @@ async fn run() -> Result<()> {
         .build()
         .context("build HTTP client")?;
 
-    let (detector_url, detector_sha) = match cfg.detector_mode {
-        DetectorMode::Yolo => (cfg.yolo_model_url.as_str(), cfg.yolo_sha256.as_deref()),
-        DetectorMode::RetinaFace => (
-            cfg.retinaface_model_url.as_str(),
-            cfg.retinaface_sha256.as_deref(),
-        ),
-    };
-    let detector = ensure_model(&http, detector_url, detector_sha, &cfg.model_cache_dir)
-        .await
-        .with_context(|| "face detector model resolution failed")?;
+    let detector =
+        ensure_model(&http, &cfg.yolo_model_url, cfg.yolo_sha256.as_deref(), &cfg.model_cache_dir)
+            .await
+            .with_context(|| "face detector model resolution failed")?;
     // Validate that the file is a loadable ONNX before serving (§3).
     model_loader::load_session(&detector.path)
         .with_context(|| format!("detector model not loadable: {}", detector.path.display()))?;
     tracing::info!(
-        "{} model ready at {} (downloaded: {})",
-        match cfg.detector_mode {
-            DetectorMode::Yolo => "YOLOv8-Face",
-            DetectorMode::RetinaFace => "RetinaFace (mobile0.25)",
-        },
+        "YOLOv8-Face model ready at {} (downloaded: {})",
         detector.path.display(),
         detector.downloaded
     );
@@ -220,6 +219,31 @@ async fn run() -> Result<()> {
                 resolved.path.display(),
                 resolved.downloaded
             );
+            // Persist the initial-deployment state so /operator/classifier
+            // shows accuracy even before (or without) any nightly retrain
+            // swap. Only written when no state exists yet or the model file
+            // changed: an accuracy validated by the retraining flow must not
+            // be overwritten with a placeholder value.
+            #[cfg(feature = "retraining")]
+            {
+                let needs_write = match crate::training::read_classifier_state(&cfg) {
+                    Some(st) => st.active_onnx != resolved.path.to_string_lossy(),
+                    None => true,
+                };
+                if needs_write {
+                    // Accuracy unknown at deploy time (no ground truth here):
+                    // record 0.0 so the operator can tell it apart from a
+                    // retrain-validated value, until the first nightly run
+                    // validates and overwrites it.
+                    if let Err(e) = crate::training::write_classifier_state(
+                        &cfg,
+                        &resolved.path,
+                        0.0,
+                    ) {
+                        tracing::warn!("cannot persist initial classifier state: {e:#}");
+                    }
+                }
+            }
             Some(SessionPool::new(resolved.path, cfg.effective_concurrency()))
         }
         None => {
@@ -263,10 +287,37 @@ async fn run() -> Result<()> {
         }
     };
 
-    let store = ModelStore::new(
+    // Optional COCO person detector for the head-fallback path
+    // (`HEAD_FALLBACK_ENABLED`): blurs the upper fraction of person boxes
+    // when the face detector finds no faces in an ACTIVE frame.
+    let coco_pool = if cfg.head_fallback_enabled {
+        let resolved = ensure_model(
+            &http,
+            &cfg.coco_model_url,
+            cfg.coco_sha256.as_deref(),
+            &cfg.model_cache_dir,
+        )
+        .await
+        .with_context(|| "COCO person detector model resolution failed")?;
+        model_loader::load_session(&resolved.path).with_context(|| {
+            format!("COCO person detector not loadable: {}", resolved.path.display())
+        })?;
+        tracing::info!(
+            "COCO person detector ready at {} (downloaded: {})",
+            resolved.path.display(),
+            resolved.downloaded
+        );
+        Some(SessionPool::new(resolved.path, cfg.effective_concurrency()))
+    } else {
+        tracing::info!("head-fallback disabled (HEAD_FALLBACK_ENABLED not set)");
+        None
+    };
+
+    let store = ModelStore::with_coco(
         SessionPool::new(detector.path.clone(), cfg.effective_concurrency()),
         classifier_pool,
         segmenter_pool,
+        coco_pool,
     );
 
     // Nightly background job: ROI finalization for expired LEARNING cameras,
@@ -296,6 +347,8 @@ async fn run() -> Result<()> {
         job_lock: Arc::new(Mutex::new(())),
         #[cfg(feature = "s3")]
         s3: None,
+        #[cfg(any(feature = "queue", feature = "rabbitmq"))]
+        queue_metrics: queue_metrics::QueueMetricsRegistry::default(),
     };
 
     // S3 backend (feature `s3`, env `S3_ENABLED=true`): instantiate the
@@ -338,10 +391,48 @@ async fn run() -> Result<()> {
                 state.worker.clone(),
                 s3_client,
                 std::sync::Arc::new(settings.clone()),
+                state.db.clone(),
             ));
         }
         state
     };
+
+    // Async queue consumers (features `queue` = SQS, `rabbitmq` = RabbitMQ):
+    // they share the SAME S3 worker (buckets, semaphores, pipeline), so job
+    // concurrency stays bounded across all ingress paths.
+    #[cfg(feature = "queue")]
+    if let Some(sqs) = state.cfg.sqs.clone() {
+        if let Some(worker) = state.s3.clone() {
+            let settings = std::sync::Arc::new(sqs);
+            let metrics = state.queue_metrics.entry("sqs");
+            tokio::spawn(async move {
+                if let Err(e) = queue_sqs::run_consumer(worker, settings, metrics).await {
+                    tracing::error!("SQS consumer exited: {e:#}");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "SQS_ENABLED=true but the S3 backend is disabled — SQS consumer not started"
+            );
+        }
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    if let Some(rabbitmq) = state.cfg.rabbitmq.clone() {
+        if let Some(worker) = state.s3.clone() {
+            let settings = std::sync::Arc::new(rabbitmq);
+            let metrics = state.queue_metrics.entry("rabbitmq");
+            tokio::spawn(async move {
+                if let Err(e) = queue_rabbitmq::run_consumer(worker, settings, metrics).await {
+                    tracing::error!("RabbitMQ consumer exited: {e:#}");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "RABBITMQ_ENABLED=true but the S3 backend is disabled — RabbitMQ consumer not started"
+            );
+        }
+    }
 
     let body_limit = state.cfg.body_limit_bytes;
     let bind_addr = state.cfg.bind_addr.clone();
@@ -364,8 +455,12 @@ async fn run() -> Result<()> {
         .route("/operator/cameras/:id/reset", post(op_reset))
         .route("/operator/cameras/:id/roi", post(op_set_roi))
         .route("/operator/retrain-audit", get(op_retrain_audit))
+        .route("/operator/classifier", get(op_classifier))
         .route("/operator/gpu", get(op_gpu))
         .route("/operator/jobs", get(op_jobs));
+
+    #[cfg(any(feature = "queue", feature = "rabbitmq"))]
+    let router = router.route("/operator/queues", get(op_queues));
 
     #[cfg(feature = "s3")]
     let router = if state.s3.is_some() {
@@ -970,6 +1065,52 @@ async fn op_retrain_audit(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 }
 
+/// `GET /operator/classifier` — current state of the binary face classifier
+/// used as the ACTIVE-branch second check (spec §4): whether it is loaded
+/// (i.e. whether the second gate is actually running), the configured source
+/// URL, the persisted accuracy + last swap from `classifier_state.json` and
+/// the live inference counters. `loaded=false` means ACTIVE blurs every
+/// in-ROI detection (fail-safe, no classifier filtering).
+async fn op_classifier(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    let pool = state.worker.store().classifier_pool();
+    #[allow(unused_mut)]
+    let mut persisted: Option<serde_json::Value> = None;
+    #[cfg(feature = "retraining")]
+    if let Some(st) = crate::training::read_classifier_state(&state.cfg) {
+        persisted = Some(serde_json::json!({
+            "active_onnx": st.active_onnx,
+            "accuracy": st.accuracy,
+            "updated_at": st.updated_at,
+        }));
+    }
+    let (mut inference_count, mut inference_avg_ms) = (0u64, 0.0f64);
+    for (stage, count, avg_ms) in crate::models::inference_stats() {
+        if stage == "classifier" {
+            inference_count = count;
+            inference_avg_ms = avg_ms;
+        }
+    }
+    // A classifier counts as loaded only when it is usable right now; a
+    // persisted state alone means it was swapped in a previous process run.
+    let active_path = pool.as_ref().map(|p| p.path().to_string_lossy().to_string());
+    Json(serde_json::json!({
+        "loaded": pool.is_some(),
+        "active_check_enabled": pool.is_some(),
+        "configured_url": state.cfg.classifier_model_url,
+        "active_onnx": active_path,
+        "persisted": persisted,
+        "inference": {
+            "count": inference_count,
+            "avg_ms": inference_avg_ms,
+        },
+        "min_accuracy_for_swap": state.cfg.retrain_min_accuracy,
+    }))
+    .into_response()
+}
+
 /// `GET /operator/gpu` — current inference execution-provider configuration
 /// plus measured per-stage inference statistics (`inference.*.count` /
 /// `avg_ms`, process-lifetime over every processed image). `device_name` is a
@@ -1089,6 +1230,33 @@ async fn op_jobs(
         "total_jobs": total_jobs,
     }))
     .into_response()
+}
+
+/// `GET /operator/queues` — live counters of the async queue consumers
+/// (features `queue` / `rabbitmq`): received, completed, failed, sent to DLQ,
+/// and the best-effort DLQ depth. Gated by `X-Operator-Key` like the other
+/// operator routes.
+#[cfg(any(feature = "queue", feature = "rabbitmq"))]
+async fn op_queues(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    let queues: Vec<serde_json::Value> = state
+        .queue_metrics
+        .snapshot_all()
+        .into_iter()
+        .map(|(name, snap)| {
+            serde_json::json!({
+                "queue": name,
+                "received": snap.received,
+                "completed": snap.completed,
+                "failed": snap.failed,
+                "dlq": snap.dlq,
+                "dlq_depth": snap.dlq_depth,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "queues": queues })).into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]

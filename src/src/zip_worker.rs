@@ -238,6 +238,12 @@ pub struct ZipProcessor {
 }
 
 impl ZipProcessor {
+    /// Shared model store (for operator introspection, e.g.
+    /// `GET /operator/classifier`).
+    pub fn store(&self) -> &ModelStore {
+        &self.store
+    }
+
     pub fn new(cfg: Arc<Config>, db: Db, store: ModelStore) -> Self {
         let capacity = cfg.effective_concurrency();
         Self {

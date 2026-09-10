@@ -28,13 +28,21 @@ pub struct Config {
     pub jpeg_quality: u8,
 
     pub yolo_model_url: String,
-    pub retinaface_model_url: String,
     pub classifier_model_url: Option<String>,
     pub model_cache_dir: PathBuf,
     pub yolo_sha256: Option<String>,
-    pub retinaface_sha256: Option<String>,
     pub classifier_sha256: Option<String>,
-    pub detector_mode: DetectorMode,
+    /// Head-fallback: when the face detector finds no faces, run a COCO
+    /// person detector and blur the upper fraction of each person box
+    /// (env `HEAD_FALLBACK_ENABLED`, default off).
+    pub head_fallback_enabled: bool,
+    /// COCO person detector model URL (env `COCO_MODEL_URL`; e.g. the
+    /// Ultralytics `yolov8n.onnx` with 80 COCO classes).
+    pub coco_model_url: String,
+    pub coco_sha256: Option<String>,
+    /// Fraction of the person box height treated as the head region
+    /// (env `HEAD_FALLBACK_FRACTION`, default 0.30).
+    pub head_fallback_fraction: f32,
     /// Face-mask segmenter for the ACTIVE blur (env `MASK_SEGMENTER`;
     /// `off` = geometric hull/ellipse, `mediapipe` = MediaPipe Selfie).
     pub mask_segmenter: MaskSegmenter,
@@ -60,9 +68,6 @@ pub struct Config {
     /// default 640). Lower values (e.g. 512) speed up detection on UHD/4K
     /// sources at a small cost in small-face recall.
     pub yolo_input_size: u32,
-    /// Stretch-resize side in px for the RetinaFace input (env
-    /// `RETINAFACE_INPUT_SIZE`, default 640).
-    pub retinaface_input_size: u32,
 
     pub data_dir: PathBuf,
     pub dataset_fp_dir: PathBuf,
@@ -145,6 +150,15 @@ pub struct Config {
     /// `s3` cargo feature is not even required.
     #[cfg(feature = "s3")]
     pub s3: Option<S3Settings>,
+
+    /// SQS async job intake (feature `queue`, env `SQS_ENABLED`). `None` when
+    /// disabled — no SQS code runs and no queue consumer is spawned.
+    #[cfg(feature = "queue")]
+    pub sqs: Option<SqsSettings>,
+
+    /// RabbitMQ async job intake (feature `rabbitmq`, env `RABBITMQ_ENABLED`).
+    #[cfg(feature = "rabbitmq")]
+    pub rabbitmq: Option<RabbitMqSettings>,
 }
 
 /// S3 ingestion/storage configuration (feature `s3`, spec §8 "Scenario S3").
@@ -172,6 +186,103 @@ pub struct S3Settings {
     /// (env `S3_WEBHOOK_ALLOWED_HOSTS`, comma-separated). Empty = webhooks
     /// rejected at submit time (anti-{SSRF,abuse} default).
     pub webhook_allowed_hosts: Vec<String>,
+}
+
+/// SQS consumer settings (feature `queue`, spec §8 "Scenario S3" extended).
+#[cfg(feature = "queue")]
+#[derive(Debug, Clone)]
+pub struct SqsSettings {
+    /// Queue URL to poll for job messages (`SQS_QUEUE_URL`).
+    pub queue_url: String,
+    /// Optional AWS region override (`SQS_REGION`); defaults to the standard
+    /// `AWS_REGION` chain used by the S3 client.
+    pub region: Option<String>,
+    /// Max messages to fetch per poll (`SQS_MAX_MESSAGES`, default 10).
+    pub max_messages: i32,
+    /// Long-poll wait seconds (`SQS_WAIT_SECONDS`, default 20).
+    pub wait_seconds: i32,
+    /// Visibility timeout applied to in-flight messages (`SQS_VISIBILITY_TIMEOUT_SECONDS`,
+    /// default 900). A job that crashes mid-run becomes visible again after
+    /// this window and is redelivered.
+    pub visibility_timeout_seconds: i32,
+    /// Base backoff after a failed poll (exponential: `base * 2^n`, capped at
+    /// `SQS_MAX_BACKOFF_SECS`). Keeps the consumer alive through transient
+    /// throttling/5xx errors instead of hot-looping.
+    pub poll_interval_secs: u64,
+    /// Cap of the exponential poll backoff (`SQS_MAX_BACKOFF_SECS`, default 60).
+    pub max_backoff_secs: u64,
+    /// Max receive attempts before a message is dropped (poison) — also used
+    /// as the `maxReceiveCount` of the auto-created redrive policy
+    /// (`SQS_MAX_RECEIVE_ATTEMPTS`, default 5).
+    pub max_receive_attempts: i32,
+}
+
+/// RabbitMQ consumer settings (feature `rabbitmq`, spec §8 "Scenario S3"
+/// extended). The consumer declares the work queue + a dead-letter queue.
+#[cfg(feature = "rabbitmq")]
+#[derive(Debug, Clone)]
+pub struct RabbitMqSettings {
+    /// AMQP URL (`RABBITMQ_URL`, default `amqp://127.0.0.1:5672`).
+    pub url: String,
+    /// Work queue name (`RABBITMQ_QUEUE`, default `anonimizzazione-jobs`).
+    pub queue: String,
+    /// Dead-letter queue name (`RABBITMQ_DLQ`, default `anonimizzazione-jobs-dlq`).
+    pub dlq: String,
+    /// Prefetch count (`RABBITMQ_PREFETCH`, default 4): max unacked messages
+    /// this consumer holds at once (each one is a concurrent job).
+    pub prefetch: u16,
+    /// Max delivery attempts before a message is sent to the DLQ
+    /// (`RABBITMQ_MAX_RETRIES`, default 3).
+    pub max_retries: u32,
+    /// Base backoff in seconds between retries (exponential: `base * 2^n`,
+    /// capped at `RABBITMQ_MAX_BACKOFF_SECS`).
+    pub retry_backoff_secs: u64,
+    /// Cap of the exponential backoff (`RABBITMQ_MAX_BACKOFF_SECS`, default 300).
+    pub max_backoff_secs: u64,
+}
+
+/// Reads `SQS_*` env vars into an optional `SqsSettings` (feature `queue` only).
+#[cfg(feature = "queue")]
+fn sqs_settings_from_env() -> Result<Option<SqsSettings>> {
+    let enabled = env_parse::<bool>("SQS_ENABLED", false)?;
+    if !enabled {
+        return Ok(None);
+    }
+    let queue_url = env_str("SQS_QUEUE_URL", "");
+    if queue_url.is_empty() {
+        anyhow::bail!("SQS_QUEUE_URL must be set when SQS is enabled");
+    }
+    Ok(Some(SqsSettings {
+        queue_url,
+        region: env_opt("SQS_REGION"),
+        max_messages: env_parse::<i32>("SQS_MAX_MESSAGES", 10)?.clamp(1, 10),
+        wait_seconds: env_parse::<i32>("SQS_WAIT_SECONDS", 20)?.clamp(0, 20),
+        visibility_timeout_seconds: env_parse::<i32>("SQS_VISIBILITY_TIMEOUT_SECONDS", 900)?
+            .max(0),
+        poll_interval_secs: env_parse::<u64>("SQS_POLL_INTERVAL_SECS", 5)?,
+        max_backoff_secs: env_parse::<u64>("SQS_MAX_BACKOFF_SECS", 60)?.max(1),
+        max_receive_attempts: env_parse::<i32>("SQS_MAX_RECEIVE_ATTEMPTS", 5)?.max(1),
+    }))
+}
+
+/// Reads `RABBITMQ_*` env vars into an optional `RabbitMqSettings` (feature
+/// `rabbitmq` only).
+#[cfg(feature = "rabbitmq")]
+fn rabbitmq_settings_from_env() -> Result<Option<RabbitMqSettings>> {
+    let enabled = env_parse::<bool>("RABBITMQ_ENABLED", false)?;
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(Some(RabbitMqSettings {
+        url: env_str("RABBITMQ_URL", "amqp://127.0.0.1:5672"),
+        queue: env_str("RABBITMQ_QUEUE", "anonimizzazione-jobs"),
+        dlq: env_str("RABBITMQ_DLQ", "anonimizzazione-jobs-dlq"),
+        prefetch: env_parse::<u16>("RABBITMQ_PREFETCH", 4)?,
+        max_retries: env_parse::<u32>("RABBITMQ_MAX_RETRIES", 3)?.max(1),
+        retry_backoff_secs: env_parse::<u64>("RABBITMQ_RETRY_BACKOFF_SECS", 5)?,
+        max_backoff_secs: env_parse::<u64>("RABBITMQ_MAX_BACKOFF_SECS", 300)?
+            .max(1),
+    }))
 }
 
 /// Reads `S3_*` env vars into an optional `S3Settings` (feature `s3` only).
@@ -232,13 +343,6 @@ pub enum AnonMode {
     Pixelate,
 }
 
-/// Face detector backend (env `DETECTOR_MODE`): YOLOv8-Face (default) or the
-/// lightweight MobileNetV1-0.25 RetinaFace export used for benchmarks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectorMode {
-    Yolo,
-    RetinaFace,
-}
 
 /// Optional face-mask segmenter for the ACTIVE blur (env `MASK_SEGMENTER`):
 /// `mediapipe` runs the MediaPipe Selfie Segmentation model per face and
@@ -249,16 +353,6 @@ pub enum DetectorMode {
 pub enum MaskSegmenter {
     Off,
     Mediapipe,
-}
-
-impl DetectorMode {
-    fn parse(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "yolo" | "yolov8" | "yolov8-face" => Ok(DetectorMode::Yolo),
-            "retinaface" | "retina" => Ok(DetectorMode::RetinaFace),
-            other => anyhow::bail!("DETECTOR_MODE '{other}' must be 'yolo' or 'retinaface'"),
-        }
-    }
 }
 
 impl MaskSegmenter {
@@ -459,18 +553,19 @@ impl Config {
                 "YOLO_MODEL_URL",
                 "https://github.com/yakhyo/yolov8-face-onnx-inference/releases/download/weights/yolov8n-face.onnx",
             ),
-            retinaface_model_url: env_str(
-                "RETINAFACE_MODEL_URL",
-                "https://github.com/yakhyo/retinaface-pytorch/releases/download/v0.0.1/retinaface_mv1_0.25.onnx",
-            ),
             classifier_model_url: env_opt("CLASSIFIER_MODEL_URL"),
             model_cache_dir: env_path("MODEL_CACHE_DIR", "/app/models/cache/"),
             yolo_sha256: env_opt("MODEL_YOLO_SHA256"),
-            retinaface_sha256: env_opt("MODEL_RETINAFACE_SHA256"),
             classifier_sha256: env_opt("MODEL_CLASSIFIER_SHA256"),
-            detector_mode: DetectorMode::parse(&env_str("DETECTOR_MODE", "yolo"))?,
+            head_fallback_enabled: env_parse::<bool>("HEAD_FALLBACK_ENABLED", false)?,
+            coco_model_url: env_str(
+                "COCO_MODEL_URL",
+                "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n.onnx",
+            ),
+            coco_sha256: env_opt("MODEL_COCO_SHA256"),
+            head_fallback_fraction: env_parse::<f32>("HEAD_FALLBACK_FRACTION", 0.30)?
+                .clamp(0.05, 0.9),
             yolo_input_size: parse_input_size("YOLO_INPUT_SIZE")?,
-            retinaface_input_size: parse_input_size("RETINAFACE_INPUT_SIZE")?,
             mask_segmenter: MaskSegmenter::parse(&env_str("MASK_SEGMENTER", "off"))?,
             selfie_segmenter_url: env_str(
                 "SELFIE_SEGMENTER_MODEL_URL",
@@ -540,6 +635,10 @@ impl Config {
 
             #[cfg(feature = "s3")]
             s3: s3_settings_from_env()?,
+            #[cfg(feature = "queue")]
+            sqs: sqs_settings_from_env()?,
+            #[cfg(feature = "rabbitmq")]
+            rabbitmq: rabbitmq_settings_from_env()?,
         };
 
         if cfg.roi_area_min >= cfg.roi_area_max {
@@ -578,15 +677,15 @@ impl Config {
             max_concurrent_images: Some(2),
             jpeg_quality: 95,
             yolo_model_url: String::new(),
-            retinaface_model_url: String::new(),
             classifier_model_url: None,
             model_cache_dir: PathBuf::from("/tmp/av-models-cache"),
             yolo_sha256: None,
-            retinaface_sha256: None,
             classifier_sha256: None,
-            detector_mode: DetectorMode::Yolo,
+            head_fallback_enabled: false,
+            coco_model_url: String::new(),
+            coco_sha256: None,
+            head_fallback_fraction: 0.30,
             yolo_input_size: 640,
-            retinaface_input_size: 640,
             mask_segmenter: MaskSegmenter::Off,
             selfie_segmenter_url: String::new(),
             selfie_segmenter_sha256: None,
@@ -634,6 +733,10 @@ impl Config {
             enable_fp16: false,
             #[cfg(feature = "s3")]
             s3: None,
+            #[cfg(feature = "queue")]
+            sqs: None,
+            #[cfg(feature = "rabbitmq")]
+            rabbitmq: None,
         }
     }
 }

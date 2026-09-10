@@ -55,7 +55,7 @@ use crate::models::run_yolo;
 
 const SETTING_NAMES: [&str; 3] = ["easy", "medium", "hard"];
 const SWEEP_STEPS: usize = 1000;
-const OPERATING_POINTS: [f32; 3] = [0.5, 0.25, 0.1];
+const OPERATING_POINTS: [f32; 5] = [0.5, 0.25, 0.1, 0.05, 0.02];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Difficulty {
@@ -71,6 +71,9 @@ struct GtBox {
     x2: f32,
     y2: f32,
     diff: Difficulty,
+    /// `pose` attribute from the GT (0 = typical frontal, 1 = atypical,
+    /// e.g. profile). Used for the profile-recall breakdown.
+    pose: f32,
     /// `ignore == 1` in the GT file: excluded from recall, still consumes
     /// matching detections.
     ignored: bool,
@@ -152,6 +155,7 @@ fn parse_gt(path: &PathBuf) -> Result<Vec<GtImage>> {
                     x2: x1 + w,
                     y2: y1 + h,
                     diff: difficulty(w, h, blur, illum, occ, pose),
+                    pose,
                     ignored,
                 });
                 parsed += 1;
@@ -163,6 +167,47 @@ fn parse_gt(path: &PathBuf) -> Result<Vec<GtImage>> {
     }
     flush(&cur_name, &mut cur_boxes);
     Ok(images)
+}
+
+/// Labels detections against GT faces carrying a specific `pose` value
+/// (pose==1 = atypical profile, the case that motivated this benchmark).
+/// Greedy matching against ALL boxes (so a detection matching a frontal face
+/// consumes it and is not double-counted); TP only for non-ignored boxes with
+/// the target pose, everything else Excluded/FP — same semantics as the
+/// per-setting `label_detections`.
+fn label_pose(
+    gt: &[GtBox],
+    pose_target: f32,
+    dets: &[(f32, f32, f32, f32, f32)], // (x1, y1, x2, y2, score)
+    iou_thresh: f32,
+) -> Vec<DetLabel> {
+    let mut consumed = vec![false; gt.len()];
+    let mut labels = Vec::with_capacity(dets.len());
+    for (x1, y1, x2, y2, _score) in dets {
+        let mut best_iou = 0.0f32;
+        let mut best_idx = usize::MAX;
+        for (i, b) in gt.iter().enumerate() {
+            let o = iou(b, *x1, *y1, *x2, *y2);
+            if o > best_iou {
+                best_iou = o;
+                best_idx = i;
+            }
+        }
+        if best_iou >= iou_thresh {
+            let b = &gt[best_idx];
+            if b.ignored || b.pose != pose_target {
+                labels.push(DetLabel::Excluded);
+            } else if !consumed[best_idx] {
+                consumed[best_idx] = true;
+                labels.push(DetLabel::Tp);
+            } else {
+                labels.push(DetLabel::Fp);
+            }
+        } else {
+            labels.push(DetLabel::Fp);
+        }
+    }
+    labels
 }
 
 fn difficulty(w: f32, h: f32, blur: f32, illum: f32, occ: f32, pose: f32) -> Difficulty {
@@ -386,6 +431,9 @@ pub fn run(args: &[String]) -> Result<()> {
 
     // Per-setting accumulation: faces count + (scores, labels) per image.
     let mut acc = BTreeMap::<Difficulty, (usize, Vec<(Vec<f32>, Vec<DetLabel>)>)>::new();
+    // Pose breakdown: (count_faces, labels per image) for pose==0 and pose==1.
+    type PoseAcc = (usize, Vec<(Vec<f32>, Vec<DetLabel>)>);
+    let mut acc_pose: [PoseAcc; 2] = std::array::from_fn(|_| (0usize, Vec::new()));
     let mut processed = 0usize;
     let mut missing = 0usize;
     for (idx, gt_img) in gts.iter().enumerate() {
@@ -436,6 +484,17 @@ pub fn run(args: &[String]) -> Result<()> {
                 .1
                 .push((scores, label_detections(&gt_img.boxes, setting, &dets, iou)));
         }
+        for pose_val in [0usize, 1usize] {
+            acc_pose[pose_val].0 += gt_img
+                .boxes
+                .iter()
+                .filter(|b| !b.ignored && b.pose == pose_val as f32)
+                .count();
+            let scores: Vec<f32> = dets.iter().map(|d| d.4).collect();
+            acc_pose[pose_val]
+                .1
+                .push((scores, label_pose(&gt_img.boxes, pose_val as f32, &dets, iou)));
+        }
         processed += 1;
         if processed.is_multiple_of(50) {
             tracing::info!("eval-wider: {processed} images processed");
@@ -455,29 +514,64 @@ pub fn run(args: &[String]) -> Result<()> {
         per_setting.push((setting, res));
     }
 
+    // Pose breakdown results (recall of profile faces is the headline metric
+    // for this benchmark).
+    let mut pose_rows = Vec::new();
+    for pose_val in [0usize, 1usize] {
+        let (count, images) = &acc_pose[pose_val];
+        let res = evaluate_setting(images, *count);
+        pose_rows.push((pose_val, count, res));
+    }
+
     println!();
     println!("WIDER FACE validation — {model}");
     println!(
         "det_conf={det_conf}  nms_iou={nms_iou}  match_iou={iou}  images={processed}  missing={missing}"
     );
+    let header: Vec<String> = OPERATING_POINTS
+        .iter()
+        .flat_map(|c| vec![format!("R@{c}"), format!("P@{c}")])
+        .collect();
+    let dash: Vec<String> = OPERATING_POINTS
+        .iter()
+        .flat_map(|_| vec!["-----".into(), "-----".into()])
+        .collect();
     println!();
     println!(
-        "{:<8} {:>10} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "setting", "faces", "AP", "R@0.5", "P@0.5", "R@0.25", "P@0.25", "R@0.1"
+        "{:<8} {:>10} {:>8} {}",
+        "setting",
+        "faces",
+        "AP",
+        header.join(" ")
     );
-    println!(
-        "{:<8} {:>10} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "-------", "-----", "----", "-----", "-----", "------", "------", "-----"
-    );
+    println!("{:<8} {:>10} {:>8} {}", "-------", "-----", "----", dash.join(" "));
     for (setting, res) in &per_setting {
         let name = SETTING_NAMES[*setting as usize];
-        // point_at returns (recall, precision) at the given score threshold.
-        let (r05, p05) = point_at(&res.sweep, OPERATING_POINTS[0]);
-        let (r25, p25) = point_at(&res.sweep, OPERATING_POINTS[1]);
-        let (r10, _p10) = point_at(&res.sweep, OPERATING_POINTS[2]);
+        let mut cols = String::new();
+        for c in OPERATING_POINTS {
+            let (r, p) = point_at(&res.sweep, c);
+            cols.push_str(&format!(" {r:>7.3} {p:>7.3}"));
+        }
         println!(
-            "{:<8} {:>10} {:>8.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}",
-            name, res.count_faces, res.ap, r05, p05, r25, p25, r10
+            "{:<8} {:>10} {:>8.3}{}",
+            name, res.count_faces, res.ap, cols
+        );
+    }
+    println!();
+    println!("Pose breakdown (pose=0 frontal, pose=1 atypical/profile):");
+    let r_header: Vec<String> = OPERATING_POINTS.iter().map(|c| format!("R@{c}")).collect();
+    let r_dash: Vec<&str> = OPERATING_POINTS.iter().map(|_| "-----").collect();
+    println!("{:<8} {:>10} {:>8} {}", "pose", "faces", "AP", r_header.join(" "));
+    println!("{:<8} {:>10} {:>8} {}", "----", "-----", "----", r_dash.join(" "));
+    for (pose_val, count, res) in &pose_rows {
+        let mut cols = String::new();
+        for c in OPERATING_POINTS {
+            let (r, _p) = point_at(&res.sweep, c);
+            cols.push_str(&format!(" {r:>7.3}"));
+        }
+        println!(
+            "{:<8} {:>10} {:>8.3}{}",
+            pose_val, count, res.ap, cols
         );
     }
     println!();
@@ -512,6 +606,7 @@ mod tests {
             x2: x1 + w,
             y2: y1 + h,
             diff: d,
+            pose: 0.0,
             ignored,
         }
     }

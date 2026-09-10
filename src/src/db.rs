@@ -50,6 +50,26 @@ pub struct Camera {
     pub frame_height: Option<u32>,
 }
 
+/// One persisted async job row (S3/queue consumers, `/status/:job_id`). Plain
+/// string/number projection so `db.rs` stays feature-independent (the typed
+/// `S3JobStatus` mapping lives in `zip_worker_s3.rs`).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3JobRow {
+    pub job_id: String,
+    pub input_key: String,
+    pub output_key: String,
+    /// "queued" | "running" | "done" | "failed" (matches `S3JobState`).
+    pub state: String,
+    pub processed_images: i64,
+    pub error_count: i64,
+    pub output_size_bytes: i64,
+    pub etag: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+}
+
 /// A detection center point collected during LEARNING (spec §4).
 #[derive(Debug, Clone)]
 pub struct Detection {
@@ -140,7 +160,85 @@ impl Db {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_detections_camera ON detections(camera_id)")
             .execute(&self.pool)
             .await?;
+        // Async S3/queue job registry (feature `s3` and the `queue`/`rabbitmq`
+        // consumers). Persisted so `/status/:job_id` survives a restart — the
+        // durable trace is this table + the audit-log object in the logs bucket.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS s3_jobs (
+                job_id            TEXT PRIMARY KEY,
+                input_key         TEXT NOT NULL,
+                output_key        TEXT NOT NULL,
+                state             TEXT NOT NULL,
+                processed_images  INTEGER NOT NULL DEFAULT 0,
+                error_count       INTEGER NOT NULL DEFAULT 0,
+                output_size_bytes INTEGER NOT NULL DEFAULT 0,
+                etag              TEXT,
+                started_at        TEXT,
+                finished_at       TEXT,
+                error             TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
+    }
+
+    /// Inserts (or replaces) a persisted S3/queue job row. Used by the async
+    /// job tracker so job state survives process restarts.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    pub async fn job_upsert(&self, job: &S3JobRow) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO s3_jobs (
+                job_id, input_key, output_key, state, processed_images,
+                error_count, output_size_bytes, etag, started_at, finished_at, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&job.job_id)
+        .bind(&job.input_key)
+        .bind(&job.output_key)
+        .bind(&job.state)
+        .bind(job.processed_images)
+        .bind(job.error_count)
+        .bind(job.output_size_bytes)
+        .bind(&job.etag)
+        .bind(&job.started_at)
+        .bind(&job.finished_at)
+        .bind(&job.error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Loads one persisted job row by id.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    pub async fn job_get(&self, job_id: &str) -> Result<Option<S3JobRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT job_id, input_key, output_key, state, processed_images,
+                   error_count, output_size_bytes, etag, started_at, finished_at, error
+            FROM s3_jobs WHERE job_id = ?
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| S3JobRow {
+            job_id: r.get("job_id"),
+            input_key: r.get("input_key"),
+            output_key: r.get("output_key"),
+            state: r.get("state"),
+            processed_images: r.get("processed_images"),
+            error_count: r.get("error_count"),
+            output_size_bytes: r.get("output_size_bytes"),
+            etag: r.get("etag"),
+            started_at: r.get("started_at"),
+            finished_at: r.get("finished_at"),
+            error: r.get("error"),
+        }))
     }
 
     /// Fetches the camera row, creating it in INITIAL on first sight
@@ -432,6 +530,50 @@ mod tests {
         let cam = db.camera_by_id("CAM_002").await.unwrap().unwrap();
         assert_eq!(cam.state, CameraState::Initial);
         assert!(cam.roi_json.is_none());
+    }
+
+    #[tokio::test]
+    async fn s3_job_rows_roundtrip_and_upsert() {
+        let db = temp_db().await;
+        let row = S3JobRow {
+            job_id: "job-1".into(),
+            input_key: "cam.zip".into(),
+            output_key: "elaborati/cam_elaborato.zip".into(),
+            state: "queued".into(),
+            processed_images: 0,
+            error_count: 0,
+            output_size_bytes: 0,
+            etag: None,
+            started_at: None,
+            finished_at: None,
+            error: None,
+        };
+        db.job_upsert(&row).await.unwrap();
+
+        // Roundtrip.
+        let got = db.job_get("job-1").await.unwrap().unwrap();
+        assert_eq!(got, row);
+
+        // Re-submit (queue redelivery) replaces the row, it does not duplicate.
+        let updated = S3JobRow {
+            state: "running".into(),
+            processed_images: 7,
+            error_count: 1,
+            output_size_bytes: 12345,
+            etag: Some("\"abc\"".into()),
+            started_at: Some("2026-09-09T10:00:00Z".into()),
+            finished_at: None,
+            error: None,
+            ..row.clone()
+        };
+        db.job_upsert(&updated).await.unwrap();
+        let got = db.job_get("job-1").await.unwrap().unwrap();
+        assert_eq!(got.state, "running");
+        assert_eq!(got.processed_images, 7);
+        assert_eq!(got.etag.as_deref(), Some("\"abc\""));
+
+        // Unknown id → None.
+        assert!(db.job_get("nope").await.unwrap().is_none());
     }
 
     #[tokio::test]

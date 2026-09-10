@@ -63,6 +63,15 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # Unique keys / temp file names for S3 jobs (aza service already uses UUIDs
 # in the database layer; this one is scoped to the S3 worker).
 uuid = { version = "1", features = ["v4"], optional = true }
+# SQS consumer (feature `queue`): long-polls a standard SQS queue for
+# `{input_key, ...}` messages and drives each through the S3 worker — same
+# pipeline, audit log and webhook as the HTTP/S3 paths. Gated like `s3`.
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "rustls"], optional = true }
+# RabbitMQ consumer (feature `rabbitmq`): AMQP manual-ack consumer with retry
+# backoff and a dead-letter queue. lapin 4 with the explicit `tokio` runtime
+# feature; `rustls` + `rustls--ring` (portable crypto provider) so `amqps://`
+# URLs work too.
+lapin = { version = "4", default-features = false, features = ["tokio", "rustls", "rustls--ring"], optional = true }
 
 [features]
 default = []
@@ -82,6 +91,12 @@ directml = ["ort/directml"]
 # optional completion webhooks. Requires the AWS SDK deps (compile-time cost is
 # sizeable — keep off for the minimal CPU build).
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:uuid"]
+# SQS async job intake: consumer that polls an SQS queue and reuses the S3
+# worker (`s3` is implied — jobs are processed against the same buckets).
+queue = ["dep:aws-sdk-sqs", "s3"]
+# RabbitMQ async job intake: manual-ack consumer with retry backoff + DLQ,
+# reusing the same S3 worker (`s3` implied).
+rabbitmq = ["dep:lapin", "s3"]
 
 [profile.release]
 opt-level = 3
