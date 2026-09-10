@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Quantitative benchmark YOLO-only vs YOLO+classifier on a WIDER_val ZIP.
 
 Replicates the Rust ACTIVE pipeline (crop_clamped -> classifier, threshold
@@ -9,7 +9,7 @@ p_face >= 0.5, fail-safe blur on error) on the YOLOv8-Face detections:
                  (p_face >= 0.5); classifier errors count as "blur anyway"
 
 Ground truth for residual false positives / missed faces: faces confirmed
-when re-running YOLO at a very LOW confidence (0.001) + IoU matching —
+when re-running YOLO at a very LOW confidence (0.001) + IoU matching â€”
 i.e. we measure how many low-confidence YOLO faces (the probable FP pool)
 survive each configuration, and whether any high-confidence face is lost.
 
@@ -84,10 +84,10 @@ def crop_clamped(img, det):
     return img[int(y0) : int(y1), int(x0) : int(x1)]
 
 
-def classifier_confirm(clf_sess, crop):
-    """Replicates build_classifier_input + run_classifier (threshold 0.5).
+def classifier_confirm(clf_sess, crop, thr=0.5):
+    """Replicates build_classifier_input + run_classifier.
 
-    Returns (confirmed, errored).
+    Returns (confirmed, errored); confirmed = p_face >= thr.
     """
     if crop.size == 0:
         return True, True  # fail-safe: blur anyway
@@ -98,10 +98,10 @@ def classifier_confirm(clf_sess, crop):
         x = (x - IMAGENET_MEAN) / IMAGENET_STD
         x = x.transpose(2, 0, 1)[None]  # 1,3,224,224
         out = clf_sess.run(None, {clf_sess.get_inputs()[0].name: x})[0][0]
-        # softmax2(logits) -> (p_fp, p_face); confirmed = p_face >= 0.5
+        # softmax2(logits) -> (p_fp, p_face); confirmed = p_face >= thr
         e = np.exp(out - out.max())
         s = e / e.sum()
-        return s[1] >= 0.5, False
+        return s[1] >= thr, False
     except Exception:
         return True, True  # fail-safe: blur anyway
 
@@ -113,10 +113,13 @@ def main():
     ap.add_argument("--clf", default="models_cache/classifier_manual.onnx")
     ap.add_argument("--conf", type=float, default=0.02,
                     help="YOLO_CONF_THRESHOLD_ACTIVE")
+    ap.add_argument("--clf-thr", type=float, default=0.5,
+                    help="classifier confirm threshold (p_face >= thr rieps)")
     ap.add_argument("--gt-conf", type=float, default=0.001,
                     help="low-conf pass used as FP-pool reference")
     ap.add_argument("--max-images", type=int, default=0)
     args = ap.parse_args()
+    thr = args.clf_thr
 
     face_sess = ort.InferenceSession(args.face, providers=["CPUExecutionProvider"])
     clf_sess = ort.InferenceSession(args.clf, providers=["CPUExecutionProvider"])
@@ -161,10 +164,10 @@ def main():
             if best > 0.45:
                 ref_matched.append(r)
         # Reference faces = reference dets matching a 0.02 detection
-        # (high recall assumption) — used for missed-face accounting.
+        # (high recall assumption) â€” used for missed-face accounting.
         gt_faces_total += len(ref_matched)
 
-        # Which reference dets are NOT in the 0.02 set → the FP pool
+        # Which reference dets are NOT in the 0.02 set â†’ the FP pool
         # (YOLO at 0.02 already drops them; they are the faces a *lower*
         # threshold would add). For FP accounting we instead use the dets
         # at 0.02 with LOW confidence (< 0.10 = YOLO_CONF_THRESHOLD default),
@@ -179,7 +182,7 @@ def main():
         for d in dets:
             crop = crop_clamped(img, d)
             t2 = time.perf_counter()
-            ok, err = classifier_confirm(clf_sess, crop)
+            ok, err = classifier_confirm(clf_sess, crop, thr)
             t3 = time.perf_counter()
             clf_ms += (t3 - t2) * 1000
             if err:
@@ -194,7 +197,7 @@ def main():
 
         # Missed faces: reference-matched faces not covered by kept dets.
         kept_yolo = dets
-        kept_clf = [d for d in dets if classifier_confirm(clf_sess, crop_clamped(img, d))[0]]
+        kept_clf = [d for d in dets if classifier_confirm(clf_sess, crop_clamped(img, d), thr)[0]]
         for r in ref_matched:
             if all(iou(r, d) <= 0.45 for d in kept_yolo):
                 missed_yolo += 1
@@ -209,24 +212,24 @@ def main():
     print()
     print(f"immagini: {len(names)}  (conf={args.conf})")
     print()
-    print("── Regioni sfocate ──")
+    print("â”€â”€ Regioni sfocate â”€â”€")
     print(f"YOLO solo:            {yolo_only_blurs}")
     print(f"YOLO+classificatore:  {yolo_clf_blurs}  "
           f"({100*(yolo_only_blurs-yolo_clf_blurs)/max(yolo_only_blurs,1):.1f}% in meno)")
     print(f"rifiuti classificatore: {clf_rejected}  errori (fail-safe blur): {clf_errors}")
     print()
-    print("── FP potenziali (dubbi, conf < 0.10) ──")
+    print("â”€â”€ FP potenziali (dubbi, conf < 0.10) â”€â”€")
     print(f"pool FP:                 {fp_pool_matched}")
     print(f"sfocati da YOLO solo:    {fp_pool_blurred_yolo} (tutti)")
     print(f"sfocati da YOLO+CLF:     {fp_pool_blurred_clf}  "
           f"({100*(fp_pool_blurred_yolo-fp_pool_blurred_clf)/max(fp_pool_matched,1):.1f}% filtrati)")
     print()
-    print("── Volti persi (rif. low-conf) ──")
+    print("â”€â”€ Volti persi (rif. low-conf) â”€â”€")
     print(f"volti riferimento:      {gt_faces_total}")
     print(f"persi YOLO solo:        {missed_yolo}")
     print(f"persi YOLO+CLF:         {missed_clf}")
     print()
-    print("── Tempi ──")
+    print("â”€â”€ Tempi â”€â”€")
     print(f"detector:  {detect_ms/n:.1f} ms/immagine")
     print(f"classifier: {clf_ms/max(yolo_only_blurs,1):.1f} ms/detection "
           f"({clf_ms/n:.1f} ms/immagine)")
@@ -234,3 +237,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -84,6 +84,27 @@ pub struct Config {
     pub fp_crop_conf_max: f32,
     pub initial_blur_sigma: f32,
     pub blur_hull_margin_pct: f32,
+    /// Ellipse (and head-fallback ellipse) margin for the ACTIVE mask
+    /// (env `BLUR_ELLIPSE_MARGIN`, default 0.05). Bigger margins widen the
+    /// masked cover around the detection box — directly counters the
+    /// "semi-transparent" look where only the skin core is blurred.
+    pub blur_ellipse_margin: f32,
+    /// Softening sigma for the ACTIVE mask edge (env `MASK_FEATHER_SIGMA`,
+    /// default 0 = auto: reuse the blur sigma). A *small* fixed value (e.g.
+    /// 8) keeps face silhouettes crisp instead of a wide translucent band on
+    /// large close-ups (where the blur sigma reaches 50 px).
+    pub mask_feather_sigma: f32,
+    /// Classifier confirm gate for ACTIVE (env `CLASSIFIER_CONFIRM_THRESHOLD`,
+    /// default 0.5): detection is blurred only if `p_face >= threshold`.
+    /// Lower values raise recall at the cost of re-blurring dubious regions;
+    /// set the model URL empty / `CLASSIFIER_MODEL_URL=` to blur everything
+    /// the face detector finds (GDPR fail-safe: never fewer blurs than YOLO).
+    pub classifier_confirm_threshold: f32,
+    /// Whether the classifier confirmation may *remove* a blur (env
+    /// `CLASSIFIER_ENFORCE`, default true). `false` loads the model for
+    /// retraining/A-B but the ACTIVE branch blurs every YOLO detection
+    /// (classification can never leave a detected face unblurred).
+    pub classifier_enforce: bool,
     pub anon_mode: AnonMode,
     pub pixelate_cell_px: u32,
 
@@ -590,6 +611,11 @@ impl Config {
             fp_crop_conf_max: env_parse::<f32>("FP_CROP_CONF_MAX", 0.50)?,
             initial_blur_sigma: env_parse::<f32>("INITIAL_BLUR_SIGMA", 20.0)?.max(1.0),
             blur_hull_margin_pct: env_parse::<f32>("BLUR_HULL_MARGIN_PCT", 0.10)?.clamp(0.0, 0.5),
+            blur_ellipse_margin: env_parse::<f32>("BLUR_ELLIPSE_MARGIN", 0.05)?.clamp(0.0, 0.5),
+            mask_feather_sigma: env_parse::<f32>("MASK_FEATHER_SIGMA", 0.0)?.clamp(0.0, 64.0),
+            classifier_confirm_threshold: env_parse::<f32>("CLASSIFIER_CONFIRM_THRESHOLD", 0.5)?
+                .clamp(0.01, 1.0),
+            classifier_enforce: env_parse::<bool>("CLASSIFIER_ENFORCE", true)?,
             anon_mode: AnonMode::parse(&env_str("ANON_MODE", "blur"))?,
             pixelate_cell_px: env_parse::<u32>("PIXELATE_CELL_PX", 12)?.clamp(2, 128),
 
@@ -664,6 +690,17 @@ impl Config {
     pub fn retention_active(&self) -> bool {
         self.retention_enabled && (self.retention_max_days > 0 || self.retention_max_gb > 0.0)
     }
+
+    /// Feather sigma for the ACTIVE mask edge: a configured
+    /// `MASK_FEATHER_SIGMA > 0` wins over the (possibly huge) per-face blur
+    /// sigma; `0` keeps the historical behavior (feather == blur sigma).
+    pub fn mask_feather(&self, blur_sigma: f32) -> f32 {
+        if self.mask_feather_sigma > 0.0 {
+            self.mask_feather_sigma.min(blur_sigma)
+        } else {
+            blur_sigma
+        }
+    }
 }
 
 #[cfg(test)]
@@ -702,6 +739,10 @@ impl Config {
             fp_crop_conf_max: 0.50,
             initial_blur_sigma: 20.0,
             blur_hull_margin_pct: 0.10,
+            blur_ellipse_margin: 0.05,
+            mask_feather_sigma: 0.0,
+            classifier_confirm_threshold: 0.5,
+            classifier_enforce: true,
             anon_mode: AnonMode::Blur,
             pixelate_cell_px: 12,
             learning_days: 30,
@@ -788,6 +829,50 @@ mod tests {
             MaskSegmenter::Mediapipe
         );
         assert!(MaskSegmenter::parse("portrait").is_err());
+    }
+
+    #[test]
+    fn blur_and_classifier_env_parsing() {
+        // Defaults (unset).
+        std::env::remove_var("BLUR_ELLIPSE_MARGIN");
+        std::env::remove_var("MASK_FEATHER_SIGMA");
+        std::env::remove_var("CLASSIFIER_CONFIRM_THRESHOLD");
+        assert_eq!(env_parse::<f32>("BLUR_ELLIPSE_MARGIN", 0.05).unwrap(), 0.05);
+        assert_eq!(env_parse::<f32>("MASK_FEATHER_SIGMA", 0.0).unwrap(), 0.0);
+        assert_eq!(
+            env_parse::<f32>("CLASSIFIER_CONFIRM_THRESHOLD", 0.5).unwrap(),
+            0.5
+        );
+        // Parsed from env.
+        std::env::set_var("BLUR_ELLIPSE_MARGIN", "0.15");
+        std::env::set_var("MASK_FEATHER_SIGMA", "8");
+        std::env::set_var("CLASSIFIER_CONFIRM_THRESHOLD", "0.2");
+        assert_eq!(env_parse::<f32>("BLUR_ELLIPSE_MARGIN", 0.05).unwrap(), 0.15);
+        assert_eq!(env_parse::<f32>("MASK_FEATHER_SIGMA", 0.0).unwrap(), 8.0);
+        assert_eq!(
+            env_parse::<f32>("CLASSIFIER_CONFIRM_THRESHOLD", 0.5).unwrap(),
+            0.2
+        );
+        // CLASSIFIER_ENFORCE default true, switchable off.
+        assert!(env_parse::<bool>("CLASSIFIER_ENFORCE", true).unwrap());
+        std::env::set_var("CLASSIFIER_ENFORCE", "false");
+        assert!(!env_parse::<bool>("CLASSIFIER_ENFORCE", true).unwrap());
+        std::env::remove_var("CLASSIFIER_ENFORCE");
+        std::env::remove_var("BLUR_ELLIPSE_MARGIN");
+        std::env::remove_var("MASK_FEATHER_SIGMA");
+        std::env::remove_var("CLASSIFIER_CONFIRM_THRESHOLD");
+    }
+
+    #[test]
+    fn mask_feather_mode() {
+        let cfg = Config::test_default();
+        // Auto mode: feather follows the blur sigma.
+        assert_eq!(cfg.mask_feather(37.5), 37.5);
+        // Configured cap wins and never exceeds the blur sigma.
+        let mut capped = Config::test_default();
+        capped.mask_feather_sigma = 8.0;
+        assert_eq!(capped.mask_feather(37.5), 8.0);
+        assert_eq!(capped.mask_feather(5.0), 5.0); // small faces: sigma wins
     }
 
     #[test]

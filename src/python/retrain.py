@@ -31,6 +31,16 @@ import random
 import sys
 from datetime import datetime, timezone
 
+# torch.onnx export prints emoji/unicode to stderr; on consoles with
+# cp1252 encoding (Windows) that raises UnicodeEncodeError and aborts the
+# nightly retraining after a successful training run. Force UTF-8 so the
+# exported model always lands (spec §6: keep the deployed classifier).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, UnicodeError):
+        pass
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 

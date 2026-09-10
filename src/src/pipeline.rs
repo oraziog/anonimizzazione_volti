@@ -68,7 +68,7 @@ impl AnonOp {
     /// mask edge with `mask_sigma` first.
     fn apply_masked(&self, img: &mut image::RgbaImage, mask: &image::GrayImage, mask_sigma: f32) {
         match *self {
-            AnonOp::Blur(s) => apply_masked_blur(img, mask, s),
+            AnonOp::Blur(s) => apply_masked_blur(img, mask, s, mask_sigma),
             AnonOp::Pixelate(c) => apply_masked_pixelate(img, mask, mask_sigma, c),
         }
     }
@@ -97,10 +97,10 @@ pub struct ProcessOutcome {
     pub processed: image::RgbaImage,
 }
 
-/// Gaussian sigma from box width: `sigma = box_width / 8` clamped to [5, 50]
+/// Gaussian sigma from box width: `sigma = box_width / 4` clamped to [5, 50]
 /// (spec §4, used in both LEARNING and ACTIVE).
 pub fn sigma_for_box(box_width: f32) -> f32 {
-    (box_width / 8.0).clamp(5.0, 50.0)
+    (box_width / 4.0).clamp(5.0, 50.0)
 }
 
 /// Blur an image region in place with a box filter approximation of the
@@ -211,7 +211,7 @@ fn mask_bbox(mask: &image::GrayImage) -> (u32, u32, u32, u32) {
 fn apply_masked(
     img: &mut image::RgbaImage,
     mask: &image::GrayImage,
-    sigma: f32,
+    feather_sigma: f32,
     op: impl Fn(&mut image::RgbaImage, i64, i64),
 ) {
     let (w, h) = img.dimensions();
@@ -225,7 +225,7 @@ fn apply_masked(
             image::ImageBuffer::from_fn(bw, bh, |x, y| {
                 image::Luma([mask.get_pixel(ox + x, oy + y).0[0] as f32])
             });
-        let blurred = imageproc::filter::gaussian_blur_f32(&f32_mask, sigma);
+        let blurred = imageproc::filter::gaussian_blur_f32(&f32_mask, feather_sigma);
         image::GrayImage::from_fn(bw, bh, |x, y| {
             let v = blurred.get_pixel(x, y).0[0];
             image::Luma([v.round().clamp(0.0, 255.0) as u8])
@@ -252,9 +252,16 @@ fn apply_masked(
     }
 }
 
-/// Blur only where the mask is set.
-fn apply_masked_blur(img: &mut image::RgbaImage, mask: &image::GrayImage, sigma: f32) {
-    apply_masked(img, mask, sigma, |scratch, _ox, _oy| {
+/// Blur only where the mask is set. `sigma` drives the Gaussian strength,
+/// `feather_sigma` the mask-edge softness (kept small on large close-ups so the
+/// silhouette stays crisp instead of a wide translucent band).
+fn apply_masked_blur(
+    img: &mut image::RgbaImage,
+    mask: &image::GrayImage,
+    sigma: f32,
+    feather_sigma: f32,
+) {
+    apply_masked(img, mask, feather_sigma, |scratch, _ox, _oy| {
         let (w, h) = scratch.dimensions();
         let full = Rect {
             x0: 0.0,
@@ -270,10 +277,10 @@ fn apply_masked_blur(img: &mut image::RgbaImage, mask: &image::GrayImage, sigma:
 fn apply_masked_pixelate(
     img: &mut image::RgbaImage,
     mask: &image::GrayImage,
-    mask_sigma: f32,
+    feather_sigma: f32,
     cell: u32,
 ) {
-    apply_masked(img, mask, mask_sigma, |scratch, ox, oy| {
+    apply_masked(img, mask, feather_sigma, |scratch, ox, oy| {
         // Operator runs on the mask's bbox crop; the region start(-ox)+local
         // is a uniform sub-cell shift of the frame-anchored grid (the mosaic
         // stays block-uniform; the shift is capped at `cell-1` px).
@@ -502,6 +509,7 @@ fn segmenter_mask(
     store: &ModelStore,
     img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     det: &FaceDetection,
+    ellipse_margin: f32,
 ) -> Result<image::GrayImage> {
     let pool = store
         .segmenter_pool()
@@ -518,7 +526,7 @@ fn segmenter_mask(
         imageproc::morphology::dilate(&raw, imageproc::distance_transform::Norm::LInf, rad);
 
     // Union with the box ellipse over the full frame.
-    let mut mask = mask_from_ellipse(w, h, det.bbox, 0.05);
+    let mut mask = mask_from_ellipse(w, h, det.bbox, ellipse_margin);
     let (ox, oy) = clamped_crop_origin(w, h, det.bbox);
     for (x, y, p) in dilated.enumerate_pixels() {
         if p.0[0] > 0 {
@@ -648,16 +656,20 @@ pub fn process_image(
                 // classifier is unavailable or errors, blur anyway (never
                 // fewer blurs than pure YOLO would produce).
                 let mut confirmed = true;
-                if let Some(pool) = store.classifier_pool() {
-                    let mut cls = pool.acquire()?;
-                    let crop = crop_clamped(img, det.bbox);
-                    match run_classifier(&mut cls, &crop) {
-                        Ok((_p_fp, p_face)) => confirmed = p_face >= 0.5,
-                        Err(e) => {
-                            tracing::warn!("classifier failed, blurring anyway: {e}");
+                if cfg.classifier_enforce {
+                    if let Some(pool) = store.classifier_pool() {
+                        let mut cls = pool.acquire()?;
+                        let crop = crop_clamped(img, det.bbox);
+                        match run_classifier(&mut cls, &crop) {
+                            Ok((_p_fp, p_face)) => {
+                                confirmed = p_face >= cfg.classifier_confirm_threshold
+                            }
+                            Err(e) => {
+                                tracing::warn!("classifier failed, blurring anyway: {e}");
+                            }
                         }
+                        drop(cls);
                     }
-                    drop(cls);
                 }
                 if !confirmed {
                     continue; // confirmed false positive → no blur
@@ -673,7 +685,7 @@ pub fn process_image(
                         let hull = hull_of_keypoints(kps);
                         mask_from_polygon(w, h, &hull, cfg.blur_hull_margin_pct)
                     }
-                    None => mask_from_ellipse(w, h, det.bbox, 0.05),
+                    None => mask_from_ellipse(w, h, det.bbox, cfg.blur_ellipse_margin),
                 };
                 let mask = match cfg.mask_segmenter {
                     MaskSegmenter::Off => geometry_mask(),
@@ -686,7 +698,7 @@ pub fn process_image(
                         if !segmenter_applies(cfg, det) {
                             geometry_mask()
                         } else {
-                            match segmenter_mask(w, h, store, img, det) {
+                            match segmenter_mask(w, h, store, img, det, cfg.blur_ellipse_margin) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::warn!(
@@ -699,7 +711,7 @@ pub fn process_image(
                         }
                     }
                 };
-                op.apply_masked(&mut rgba, &mask, sigma);
+                op.apply_masked(&mut rgba, &mask, cfg.mask_feather(sigma));
                 kept.push(det.clone());
             }
 
@@ -741,8 +753,8 @@ pub fn process_image(
                             x1: p.bbox.x1,
                             y1: (p.bbox.y0 + head_h).min(h as f32),
                         };
-                        let mask = mask_from_ellipse(w, h, head_rect, 0.05);
-                        op.apply_masked(&mut rgba, &mask, sigma_for_box(head_rect.width()));
+                        let mask = mask_from_ellipse(w, h, head_rect, cfg.blur_ellipse_margin);
+                        op.apply_masked(&mut rgba, &mask, cfg.mask_feather(sigma_for_box(head_rect.width())));
                         kept.push(p.clone());
                     }
                     if !persons.is_empty() {
@@ -789,7 +801,7 @@ mod tests {
 
     #[test]
     fn sigma_formula_and_clamp() {
-        assert!((sigma_for_box(80.0) - 10.0).abs() < 1e-5);
+        assert!((sigma_for_box(80.0) - 20.0).abs() < 1e-5);
         assert_eq!(sigma_for_box(8.0), 5.0); // clamped low
         assert_eq!(sigma_for_box(1000.0), 50.0); // clamped high
     }
@@ -881,7 +893,7 @@ mod tests {
                 y1: 44.0,
             },
         );
-        apply_masked_blur(&mut img, &mask, 6.0);
+        apply_masked_blur(&mut img, &mask, 6.0, 6.0);
         let inside = img.get_pixel(32, 32).0;
         let outside = img.get_pixel(5, 5).0;
         assert!(inside[0] < 250, "inside mask must be blurred");
@@ -1057,7 +1069,7 @@ mod tests {
             None,
             Some(pool),
         );
-        let mask = segmenter_mask(w, h, &store, &img, &det).unwrap();
+        let mask = segmenter_mask(w, h, &store, &img, &det, 0.05).unwrap();
         assert_eq!(mask.dimensions(), (w, h));
         // Silhouette covers the face center.
         assert_eq!(mask.get_pixel(665, 215).0[0], 255);

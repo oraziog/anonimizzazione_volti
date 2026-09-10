@@ -40,5 +40,13 @@ headers.txt
 attivo_*.zip
 attivo_out*.zip
 
+# Active-mode test dir (scripts/test-wider.ps1)
+/test-active/
+pushpop_in.zip
+
+# Test outputs & working zips (blurred faces, large)
+/sweep/
+/test-wider-sample/
+
 # Generated ONNX datasets/venvs (never commit)
 .venv-train/
