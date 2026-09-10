@@ -5,9 +5,9 @@ captured by fixed traffic/ZTL cameras, targeting GDPR compliance: **zero
 visibly-unblurred real faces in the output**, surgical precision via a binary
 classifier, and automated ROI learning per camera.
 
-Implementation of the technical specification (Italian) in
-`MD/anonimizzazione_volti.md`. The spec's section numbers are referenced
-throughout the source.
+The design rationale is captured throughout the source as `spec §N`
+comments; the associated specification document was an internal startup
+artifact and is no longer shipped with the repository.
 
 ## Architecture
 
@@ -129,6 +129,55 @@ cargo build --release --features retraining
 
 pyo3 0.21 does not support Python 3.13+/3.14, which is why the Docker base
 image pins Python 3.11.
+
+### Windows (nativo, senza Docker)
+
+Il binario **non legge `.env` da solo**: le variabili devono essere nell'ambiente
+del processo che lo avvia. Su Windows non esiste `export $(grep …)`, quindi si
+usa lo script `scripts/load-env.ps1`, che carica **tutti** i campi del `.env`
+nella sessione corrente (funziona da qualunque directory, nessun percorso del
+progetto hard-coded):
+
+```powershell
+# dalla root del progetto (src/):
+. .\scripts\load-env.ps1                    # carica ./.env nella sessione
+. .\scripts\load-env.ps1 -Show              # stampa le chiavi caricate (nasconde i secret)
+. .\scripts\load-env.ps1 -Path .\.env.prd   # file esplicito
+```
+
+Nota la sintassi **dot-source** (`. \path\script`) e non `&`: solo cosí le
+variabili entrano nella sessione corrente e restano disponibili al comando
+successivo. Formato riconosciuto: `KEY=value`, virgolette doppie/singole tolte,
+commento `#` ignorato. Utile insieme ai test già pronti:
+
+```powershell
+. .\scripts\load-env.ps1
+.\scripts\avvia-e-demo.ps1          # build + avvio + upload demo (ANON_MODE=blur|pixelate)
+.\scripts\test-wider.ps1 -Max 300   # test ACTIVE-mode su WIDER FACE
+```
+
+#### Aprire la porta del server sull'intranet (Windows Firewall)
+
+Di default il server ascolta su `0.0.0.0:8080` (`BIND_ADDR`), cioè è già
+raggiungibile da altre macchine della LAN; ma Windows Firewall blocca le
+connessioni in ingresso. Da PowerShell **amministratore**, aprire la porta:
+
+```powershell
+netsh advfirewall firewall add rule name="Anonimizzazione Volti 8080" dir=in action=allow protocol=TCP localport=8080
+```
+
+Per rimuoverla in seguito:
+
+```powershell
+netsh advfirewall firewall delete rule name="Anonimizzazione Volti 8080"
+```
+
+Altre opzioni dello stesso portale: `netsh advfirewall firewall show rule
+name="Anonimizzazione Volti 8080"`. Se il servizio gira dentro Docker Desktop,
+la regola vale per la porta pubblicata dal container (`ports: - "8080:8080"`),
+non serve altro. Nota: se la macchina è dietro un router con NAT, la regola
+firewall locale basta per la **intranet**; per l'accesso esterno servirebbe
+anche un port-forward a monte (fuori dallo scopo di questo documento).
 
 ## HTTP API
 
@@ -663,6 +712,33 @@ ellipse with its axis-aligned bounding box. Downloading the validation sets:
 - **FDDB** — folds + images from `vis-www.cs.umass.edu/fddb/` (images split
   into parts; ~2.7 GB total).
 
+### Dove scaricare immagini di test (server / demo)
+
+Il modo più rapido per provare il servizio end-to-end è uno ZIP con foto di
+volti: basta posizionarlo con la convenzione della propria installazione
+(es. `WIDER_val.zip` alla root per `test-wider.ps1`) e caricarlo su
+`POST /anonymize`. Fonti sicure e pubbliche:
+
+- **WIDER FACE val** (~365 MB, migliaia di volti reali in scena, il dataset
+  di riferimento per YOLOv8-Face) — Google Drive id
+  `1GUCogbp16PMGa39thoMMeWxp7Rp5oM8Q` (MD5
+  `dfa7d7e790efa35df3788964cf0bbaea`) oppure da `shuoyang1213.me/WIDERFACE`.
+  La val non ha annotazioni nel nome file, quindi per il harness di test
+  (`test-wider.ps1`) viene rinominata in `CAM_001_frame_XXXX.jpg` in automatico.
+  GT + download automatico: `python python/prepare_seed.py --wider-download DIR`.
+- **FDDB** (~2.7 GB, facce in condizioni reali) — `vis-www.cs.umass.edu/fddb/`,
+  immagini in parti + liste di fold per `eval-fddb`.
+- **Demo veloci singole** (per `avvia-e-demo.ps1`, scaricate a runtime):
+  `https://ultralytics.com/images/bus.jpg`, `zidane.jpg`, `face.jpg` —
+  immagini `in-the-wild` con volti ben visibili.
+- **CC0/kaggle** per costruire il seed del classificatore — vedi "Building the
+  classifier seed" qui sotto (leggere la licenza prima dell'uso in produzione).
+
+> Nota licenze: WIDER FACE e FDDB sono dataset di ricerca (free for
+> non-commercial research). Per uso dimostrativo interno vanno bene; un seed
+> da usare in produzione va verificato contro la licenza delle immagini
+> effettive (spec open point #1).
+
 ## Building the classifier seed
 
 ```bash
@@ -768,6 +844,6 @@ poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
 
 ## Layout note
 
-This crate lives in the `src/` subfolder of the repository (next to the
-specification in `MD/`); `[workspace]` is declared in its manifest so cargo
-never walks up into the outer scaffold.
+This crate lives in the `src/` subfolder of the repository; the repository-root
+`Cargo.toml` declares the workspace (build from the repo root or from inside
+`src/` — the Docker build is self-contained and works either way).

@@ -1,1 +1,4 @@
+# Rust build
 /target
+/Cargo.lock
+Cargo.lock.bak

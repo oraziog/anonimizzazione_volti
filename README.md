@@ -5,9 +5,10 @@ ZTL/traffico, orientato alla conformità GDPR: **zero volti reali visibilmente
 non offuscati in uscita**, precisione chirurgica tramite classificatore binario
 e apprendimento automatico del ROI per telecamera.
 
-Implementazione della specifica tecnica (italiano) in `MD/anonimizzazione_volti.md`;
-le sezioni del documento sono referenziate nei sorgenti. Il piè di pagina
-di `src/README.md` è il riferimento operativo completo.
+Il design rationale è espresso nei sorgenti come commenti `spec §N`; il
+documento di specifica associato era un artefatto di start-up e non è più
+incluso nel repository. Il riferimento operativo completo è
+in `src/README.md`.
 
 ## Cosa fa
 
@@ -43,7 +44,6 @@ di `src/README.md` è il riferimento operativo completo.
 | `src/docker-compose.gpu.yml` | Stack con ONNX Runtime CUDA (feature `cuda`) |
 | `src/python/` | `retrain.py` (retraining notturno), `prepare_seed.py` (seed del classificatore) |
 | `src/scripts/` | Harness di test/esplorazione (`test-wider.ps1`, `eval_wider_output.py`, `blur_compare.py`, …) |
-| `MD/anonimizzazione_volti.md` | Specifica tecnica |
 | `models_cache/` | Modelli ONNX scaricati a runtime (ignorati da git, vedi `.gitignore`) |
 
 ## Avvio rapido (backend S3 con MinIO)
@@ -83,9 +83,10 @@ designed for GDPR compliance: **zero visibly-unblurred real faces in the
 output**, surgical precision via a binary classifier, and automatic per-camera
 region-of-interest (ROI) learning.
 
-This is an implementation of the Italian technical specification in
-`MD/anonimizzazione_volti.md`; its sections are referenced throughout the
-source. The detailed operational reference lives in `src/README.md`.
+Design rationale is captured throughout the source as `spec §N` comments;
+the original specification document was an internal startup artifact and is no
+longer shipped with the repository. The full operational reference lives in
+`src/README.md`.
 
 ## What it does
 
@@ -123,7 +124,6 @@ source. The detailed operational reference lives in `src/README.md`.
 | `src/docker-compose.gpu.yml` | Stack with ONNX Runtime CUDA (feature `cuda`) |
 | `src/python/` | `retrain.py` (nightly retraining), `prepare_seed.py` (classifier seed) |
 | `src/scripts/` | Test/exploration harnesses (`test-wider.ps1`, `eval_wider_output.py`, `blur_compare.py`, …) |
-| `MD/anonimizzazione_volti.md` | Technical specification |
 | `models_cache/` | ONNX models downloaded at runtime (git-ignored, see `.gitignore`) |
 
 ## Quick start (S3 backend with MinIO)

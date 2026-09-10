@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "anonimizzazione_volti"
 version = "0.1.0"
@@ -97,7 +95,3 @@ queue = ["dep:aws-sdk-sqs", "s3"]
 # RabbitMQ async job intake: manual-ack consumer with retry backoff + DLQ,
 # reusing the same S3 worker (`s3` implied).
 rabbitmq = ["dep:lapin", "s3"]
-
-[profile.release]
-opt-level = 3
-lto = "thin"
