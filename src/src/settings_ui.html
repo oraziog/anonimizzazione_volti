@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Impostazioni runtime — Anonimizzazione Volti</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, Segoe UI, Roboto, sans-serif;
+    background: #16181d; color: #e8eaed; line-height: 1.5;
+  }
+  header {
+    padding: 16px 24px; background: #1e2229; border-bottom: 1px solid #2c313a;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .sub { color: #9aa3af; font-size: 12px; }
+  .wrap { max-width: 880px; margin: 24px auto; padding: 0 16px; }
+  .keybar {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    background: #1e2229; border: 1px solid #2c313a; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px;
+  }
+  .keybar label { font-size: 13px; color: #9aa3af; }
+  input[type=password], input[type=number], select {
+    background: #232830; color: #e8eaed; border: 1px solid #38404d; border-radius: 6px; padding: 6px 8px; font-size: 14px;
+  }
+  input[type=password] { flex: 1; min-width: 180px; }
+  button {
+    background: #3b6fe0; color: #fff; border: none; border-radius: 6px; padding: 8px 14px;
+    font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #4d7df0; }
+  button.ghost { background: #2a3040; }
+  button.ghost:hover { background: #35405a; }
+  button.danger { background: #a03a3a; }
+  button.danger:hover { background: #bd4a4a; }
+  #status { font-size: 13px; color: #9aa3af; margin: 8px 0 4px; }
+  #status.ok { color: #7fd08a; }
+  #status.err { color: #ff8b8b; }
+  fieldset { border: 1px solid #2c313a; border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; }
+  legend { font-size: 13px; color: #9aa3af; padding: 0 6px; }
+  .row {
+    display: flex; align-items: center; gap: 12px; padding: 8px 0;
+    border-bottom: 1px solid #242832;
+  }
+  .row:last-child { border-bottom: none; }
+  .row .meta { flex: 1; min-width: 0; }
+  .row .name { font-size: 14px; font-weight: 600; }
+  .row .hint { font-size: 12px; color: #8a93a0; margin-top: 2px; }
+  .row .def { font-size: 12px; color: #66707d; margin-top: 1px; }
+  .row .ctrl { display: flex; align-items: center; gap: 8px; }
+  .row input[type=number] { width: 110px; }
+  .row input[type=checkbox] { width: 20px; height: 20px; }
+  .row select { min-width: 130px; }
+  .resetbtn { background: none; border: none; color: #7f8ea8; font-size: 12px; cursor: pointer; padding: 4px; text-decoration: underline; }
+  .resetbtn:hover { color: #aab9d6; }
+  .actions { display: flex; gap: 10px; margin: 18px 0 30px; }
+  .hidden { display: none; }
+  .spinner { color: #9aa3af; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Impostazioni runtime</h1>
+    <div class="sub">Anonimizzazione Volti — modifiche applicate senza riavvio, salvate in DATA_DIR/runtime_config.json</div>
+  </div>
+  <div class="sub" id="persist"></div>
+</header>
+
+<div class="wrap">
+  <div class="keybar">
+    <label for="opkey">Operator API key</label>
+    <input type="password" id="opkey" placeholder="X-Operator-Key" autocomplete="off">
+    <button id="loadbtn">Carica</button>
+  </div>
+  <div id="status">Inserisci la chiave operator e premi <b>Carica</b>.</div>
+
+  <div id="form" class="hidden">
+    <div id="fields"></div>
+    <div class="actions">
+      <button id="savebtn">Salva modifiche</button>
+      <button id="resetallbtn" class="danger">Ripristina tutti i valori .env</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KEY_STORE = "av_operator_key";
+let currentFields = [];
+
+function setStatus(msg, cls) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = cls || "";
+}
+
+function authHeaders(extra) {
+  return Object.assign({
+    "Content-Type": "application/json",
+    "X-Operator-Key": $("opkey").value.trim(),
+  }, extra || {});
+}
+
+async function loadSettings() {
+  const key = $("opkey").value.trim();
+  if (!key) { setStatus("Chiave operator mancante.", "err"); return; }
+  localStorage.setItem(KEY_STORE, key);
+  setStatus("Caricamento…");
+  try {
+    const resp = await fetch("/operator/settings.json", { headers: authHeaders() });
+    const data = await resp.json();
+    if (!resp.ok) { setStatus("Errore: " + (data.error || resp.status), "err"); return; }
+    currentFields = data.fields || [];
+    $("persist").textContent = "overrides: " + (data.overrides_file || "");
+    renderFields();
+    $("form").classList.remove("hidden");
+    setStatus("Valori correnti caricati.");
+  } catch (e) {
+    setStatus("Errore di rete: " + e.message, "err");
+  }
+}
+
+function renderFields() {
+  const container = $("fields");
+  container.innerHTML = "";
+  for (const f of currentFields) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.dataset.key = f.key;
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = f.label;
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = f.hint || "";
+    const def = document.createElement("div");
+    def.className = "def";
+    def.textContent = "default (.env): " + JSON.stringify(f.default);
+    meta.append(name, hint, def);
+
+    const ctrl = document.createElement("div");
+    ctrl.className = "ctrl";
+
+    let input;
+    if (f.kind === "bool") {
+      input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !!f.value;
+    } else if (f.kind === "enum") {
+      input = document.createElement("select");
+      for (const opt of (f.options || [])) {
+        const o = document.createElement("option");
+        o.value = opt;
+        o.textContent = opt;
+        if (opt === f.value) o.selected = true;
+        input.appendChild(o);
+      }
+    } else {
+      input = document.createElement("input");
+      input.type = "number";
+      if (f.min !== null && f.min !== undefined) input.min = f.min;
+      if (f.max !== null && f.max !== undefined) input.max = f.max;
+      if (f.step !== null && f.step !== undefined) input.step = f.step;
+      input.value = f.value;
+    }
+    input.dataset.key = f.key;
+    input.classList.add("set");
+    ctrl.appendChild(input);
+
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "resetbtn";
+    reset.textContent = "reset";
+    reset.addEventListener("click", () => {
+      const k = f.key;
+      const elInput = document.querySelector(`[data-key="${k}"].set`);
+      if (f.kind === "bool") { elInput.checked = !!f.default; }
+      else { elInput.value = f.default; }
+    });
+    ctrl.appendChild(reset);
+
+    row.append(meta, ctrl);
+    container.appendChild(row);
+  }
+}
+
+function collectValues() {
+  const out = {};
+  for (const f of currentFields) {
+    const el = document.querySelector(`[data-key="${f.key}"].set`);
+    if (!el) continue;
+    if (f.kind === "bool") out[f.key] = el.checked;
+    else if (f.kind === "enum") out[f.key] = el.value;
+    else if (f.kind === "int") out[f.key] = parseInt(el.value, 10);
+    else out[f.key] = parseFloat(el.value);
+  }
+  return out;
+}
+
+async function postSettings(body) {
+  const resp = await fetch("/operator/settings.json", {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    setStatus("Errore: " + (data.error || resp.status), "err");
+    return;
+  }
+  currentFields = data.fields || currentFields;
+  renderFields();
+  setStatus("Modifiche salvate.");
+}
+
+async function saveAll() {
+  try { await postSettings({ set: collectValues() }); }
+  catch (e) { setStatus("Errore di rete: " + e.message, "err"); }
+}
+
+async function resetAll() {
+  if (!confirm("Ripristinare tutti i valori ai default .env?")) return;
+  try { await postSettings({ reset_all: true }); }
+  catch (e) { setStatus("Errore di rete: " + e.message, "err"); }
+}
+
+$("loadbtn").addEventListener("click", loadSettings);
+$("savebtn").addEventListener("click", saveAll);
+$("resetallbtn").addEventListener("click", resetAll);
+$("opkey").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSettings(); });
+
+const saved = localStorage.getItem(KEY_STORE);
+if (saved) {
+  $("opkey").value = saved;
+  loadSettings();
+}
+</script>
+</body>
+</html>

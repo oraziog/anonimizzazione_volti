@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::Semaphore;
 
-use crate::config::Config;
+use crate::config::{Config, RuntimeConfig};
 use crate::db::{Camera, CameraState, Db, Detection};
 use crate::models::ModelStore;
 use crate::pipeline::{process_image, Branch};
@@ -230,7 +230,7 @@ pub struct ZipJobOutcome {
 /// The bounded-concurrency ZIP processor (spec §2, §9).
 #[derive(Clone)]
 pub struct ZipProcessor {
-    cfg: Arc<Config>,
+    cfg: RuntimeConfig,
     db: Db,
     store: ModelStore,
     semaphore: Arc<Semaphore>,
@@ -244,8 +244,8 @@ impl ZipProcessor {
         &self.store
     }
 
-    pub fn new(cfg: Arc<Config>, db: Db, store: ModelStore) -> Self {
-        let capacity = cfg.effective_concurrency();
+    pub fn new(cfg: RuntimeConfig, db: Db, store: ModelStore) -> Self {
+        let capacity = cfg.snapshot().effective_concurrency();
         Self {
             cfg,
             db,
@@ -262,8 +262,8 @@ impl ZipProcessor {
     /// Resolved data dir of this processor (the S3 worker stages its scratch
     /// files there so uploads/downloads never hit cross-device copies).
     #[cfg(feature = "s3")]
-    pub fn data_dir(&self) -> &std::path::Path {
-        &self.cfg.data_dir
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        self.cfg.snapshot().data_dir.clone()
     }
 
     /// Resolves a camera row once per camera id per job: the first image of a
@@ -353,6 +353,7 @@ impl ZipProcessor {
         // (spec §8 STORE), zero compression — never buffered in RAM.
         let out_path = self
             .cfg
+            .snapshot()
             .data_dir
             .join(sanitize_filename(&output_stem(input_name)));
         let out_file = std::fs::File::create(&out_path)
@@ -473,7 +474,7 @@ impl ZipProcessor {
         job_stamp: String,
     ) -> (String, anyhow::Result<(String, ImageOutcome)>) {
         let db = self.db.clone();
-        let cfg = self.cfg.clone();
+        let cfg = self.cfg.snapshot();
         let store = self.store.clone();
         let errors = self.errors.clone();
         let out_name = job.out_name.clone();
@@ -613,7 +614,7 @@ impl ZipProcessor {
         let entry_errors: Vec<ArchiveEntryError> = Vec::new();
 
         let job_stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f").to_string();
-        let scratch = self.cfg.data_dir.join(format!("tmp_7z_{job_stamp}"));
+        let scratch = self.cfg.snapshot().data_dir.join(format!("tmp_7z_{job_stamp}"));
         std::fs::create_dir_all(&scratch).context("create 7z scratch dir")?;
 
         // Decompression is CPU/IO-bound and never touches the async runtime.
@@ -639,7 +640,7 @@ impl ZipProcessor {
         let entry_errors: Vec<ArchiveEntryError> = Vec::new();
 
         let job_stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f").to_string();
-        let scratch = self.cfg.data_dir.join(format!("tmp_rar_{job_stamp}"));
+        let scratch = self.cfg.snapshot().data_dir.join(format!("tmp_rar_{job_stamp}"));
         std::fs::create_dir_all(&scratch).context("create rar scratch dir")?;
 
         let path2 = path.to_path_buf();
@@ -705,6 +706,7 @@ impl ZipProcessor {
         // (spec §8 STORE), zero compression — never buffered in RAM.
         let out_path = self
             .cfg
+            .snapshot()
             .data_dir
             .join(sanitize_filename(&output_stem(input_name)));
         let out_file = std::fs::File::create(&out_path)
@@ -815,7 +817,7 @@ impl ZipProcessor {
         paths: &[std::path::PathBuf],
         extra_errors: &[ArchiveEntryError],
     ) -> Result<(std::path::PathBuf, u64)> {
-        let out_path = self.cfg.data_dir.join(sanitize_filename(combined_name));
+        let out_path = self.cfg.snapshot().data_dir.join(sanitize_filename(combined_name));
         let out_path2 = out_path.clone();
         let paths2 = paths.to_vec();
         let extra2 = extra_errors.to_vec();
@@ -1775,7 +1777,7 @@ mod tests {
         let dir = test_temp_dir("merge");
         let cfg = test_cfg(&dir);
         let db = Db::open(&dir.join("t.sqlite3")).await.unwrap();
-        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
 
         let zip1 = dir.join("a.zip");
         let zip2 = dir.join("b.zip");
@@ -1834,7 +1836,7 @@ mod tests {
         let dir = test_temp_dir("merge_dup");
         let cfg = test_cfg(&dir);
         let db = Db::open(&dir.join("t.sqlite3")).await.unwrap();
-        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
 
         let zip1 = dir.join("lotto1.zip");
         write_zip(
@@ -1879,7 +1881,7 @@ mod tests {
         let spool = dir.join("upload_20260101_test.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
 
-        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
         let outcome = processor
             .process_archive_file("test.zip", &spool)
             .await
@@ -1964,7 +1966,7 @@ mod tests {
         let spool = dir.join("upload_x.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
 
-        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
         let outcome = processor
             .process_archive_file("x.zip", &spool)
             .await
@@ -2002,7 +2004,7 @@ mod tests {
         ]);
         let spool = dir.join("up.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
-        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
         let outcome = processor
             .process_archive_file("up.zip", &spool)
             .await
@@ -2041,7 +2043,7 @@ mod tests {
         let zip2 = build_zip(&[("CAM_001/a.jpg", jpeg.as_slice())]);
         let spool2 = dir2.join("up.zip");
         std::fs::write(&spool2, &zip2).unwrap();
-        let p2 = ZipProcessor::new(Arc::new(cfg2.clone()), db2, store_without_models());
+        let p2 = ZipProcessor::new(RuntimeConfig::fixed(cfg2.clone()), db2, store_without_models());
         let out2 = p2
             .process_archive_file("up.zip", &spool2)
             .await
@@ -2069,7 +2071,7 @@ mod tests {
         let zip_bytes = build_zip(&[("CAM_001/frame1.jpg", jpeg.as_slice())]);
         let spool = dir.join("up.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
-        let processor = ZipProcessor::new(Arc::new(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
         let outcome = processor
             .process_archive_file("up.zip", &spool)
             .await

@@ -64,7 +64,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use crate::config::{Config, MaskSegmenter};
+use crate::config::{Config, MaskSegmenter, RuntimeConfig};
 use crate::db::{Camera, Db};
 use crate::model_loader::{ensure_model, ExecutionSettings};
 use crate::models::{ModelStore, SessionPool};
@@ -78,6 +78,10 @@ const DB_FILENAME: &str = "anonimizzazione_volti.sqlite3";
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
+    /// Hot-reloadable runtime settings (operator settings UI): the same
+    /// handle shared by the worker and both background loops, so a patch
+    /// applied here is picked up by the next snapshot.
+    settings: RuntimeConfig,
     db: Db,
     worker: ZipProcessor,
     /// Global single-job lock: concurrent uploads get HTTP 429 (§2).
@@ -139,7 +143,8 @@ async fn run() -> Result<()> {
         _ => {}
     }
 
-    let cfg = Arc::new(Config::from_env().context("invalid configuration")?);
+    let runtime = RuntimeConfig::from_env().context("invalid configuration")?;
+    let cfg = runtime.snapshot();
     tracing::info!(
         "effective image concurrency: {} ({} core(s), env override {:?})",
         cfg.effective_concurrency(),
@@ -320,30 +325,31 @@ async fn run() -> Result<()> {
         coco_pool,
     );
 
-    // Nightly background job: ROI finalization for expired LEARNING cameras,
+// Nightly background job: ROI finalization for expired LEARNING cameras,
     // then (optionally) classifier retraining (§5, §6).
     {
-        let cfg = cfg.clone();
+        let sched = runtime.clone();
         let db = db.clone();
         let store = store.clone();
         tokio::spawn(async move {
-            background_loop(cfg, db, store).await;
+            background_loop(sched, db, store).await;
         });
     }
 
     // STORE-output retention: periodic cleanup of the anonymized ZIPs that
     // accumulate in DATA_DIR (age and/or total-size rules, env `RETENTION_*`).
     if cfg.retention_active() {
-        let cfg = cfg.clone();
+        let runtime = runtime.clone();
         tokio::spawn(async move {
-            retention::retention_loop(cfg).await;
+            retention::retention_loop(runtime).await;
         });
     }
 
     let state = AppState {
         cfg: cfg.clone(),
+        settings: runtime.clone(),
         db: db.clone(),
-        worker: ZipProcessor::new(cfg.clone(), db, store),
+        worker: ZipProcessor::new(runtime.clone(), db, store),
         job_lock: Arc::new(Mutex::new(())),
         #[cfg(feature = "s3")]
         s3: None,
@@ -457,7 +463,12 @@ async fn run() -> Result<()> {
         .route("/operator/retrain-audit", get(op_retrain_audit))
         .route("/operator/classifier", get(op_classifier))
         .route("/operator/gpu", get(op_gpu))
-        .route("/operator/jobs", get(op_jobs));
+        .route("/operator/jobs", get(op_jobs))
+        .route("/operator/settings", get(op_settings_page))
+        .route(
+            "/operator/settings.json",
+            get(op_settings_json).post(op_settings_post),
+        );
 
     #[cfg(any(feature = "queue", feature = "rabbitmq"))]
     let router = router.route("/operator/queues", get(op_queues));
@@ -1259,6 +1270,66 @@ async fn op_queues(State(state): State<AppState>, headers: HeaderMap) -> Respons
     Json(serde_json::json!({ "queues": queues })).into_response()
 }
 
+/// `GET /operator/settings` — the operator settings UI. The page itself is an
+/// inert static template (it contains no data), but the JSON endpoints it
+/// talks to are gated by `X-Operator-Key` like every other operator route.
+async fn op_settings_page() -> impl IntoResponse {
+    axum::response::Html(SETTINGS_UI_HTML)
+}
+
+const SETTINGS_UI_HTML: &str = include_str!("settings_ui.html");
+
+/// `GET /operator/settings.json` — schema + safe-effective/default values of
+/// every hot-tunable knob, so the browser renders the form from data (no
+/// server-side HTML template to keep in sync).
+async fn op_settings_json(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    Json(serde_json::json!({
+        "fields": state.settings.field_specs(),
+        "overrides_file": crate::config::RUNTIME_CONFIG_FILENAME,
+    }))
+    .into_response()
+}
+
+/// `POST /operator/settings.json` — body `{"set": {key: value, ...}}` applies
+/// a patch (clamped + validated), `{"reset_all": true}` restores the plain
+/// `.env` values. Each write is persisted to `DATA_DIR/runtime_config.json`.
+#[derive(Debug, serde::Deserialize)]
+struct SettingsPatch {
+    set: Option<serde_json::Map<String, serde_json::Value>>,
+    reset_all: Option<bool>,
+}
+
+async fn op_settings_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SettingsPatch>,
+) -> Response {
+    if let Err(resp) = operator_authorized(&state, &headers) {
+        return resp;
+    }
+    let result = if body.reset_all == Some(true) {
+        state.settings.reset_to_env("", true)
+    } else if let Some(patch) = body.set {
+        state.settings.apply_patch(&patch)
+    } else {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "body must contain 'set' or 'reset_all': true",
+        );
+    };
+    match result {
+        Ok(()) => Json(serde_json::json!({
+            "fields": state.settings.field_specs(),
+            "overrides_file": crate::config::RUNTIME_CONFIG_FILENAME,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct JobsQuery {
     limit: Option<usize>,
@@ -1428,18 +1499,21 @@ fn json_err(status: StatusCode, message: impl Into<String>) -> Response {
 /// Nightly scheduler (§5 ROI finalization + dynamic ROI, §6 retraining). Also
 /// runs a catch-up pass at startup so cameras whose LEARNING window expired
 /// while the service was down still transition promptly.
-async fn background_loop(cfg: Arc<Config>, db: Db, store: ModelStore) {
+async fn background_loop(runtime: RuntimeConfig, db: Db, store: ModelStore) {
     tracing::info!("background scheduler started");
+    let cfg = runtime.snapshot();
     finalize_expired_rois(&cfg, &db).await;
     reextract_active_rois(&cfg, &db).await;
 
     loop {
+        let cfg = runtime.snapshot();
         let wait = cfg
             .retrain_schedule
             .next_occurrence_from(chrono::Local::now().time());
         tracing::info!("next nightly run in {}s", wait.as_secs());
         tokio::time::sleep(wait).await;
         tracing::info!("nightly run starting");
+        let cfg = runtime.snapshot();
         finalize_expired_rois(&cfg, &db).await;
         reextract_active_rois(&cfg, &db).await;
         prune_old_detections(&cfg, &db).await;

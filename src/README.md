@@ -289,6 +289,18 @@ curl -H "X-Operator-Key: $KEY" http://localhost:8080/operator/gpu
 # archive, images, errors, output size, timestamps; orphan *_elaborato.zip
 # files are reported too. Optional ?limit=N (default 20, max 500).
 curl -H "X-Operator-Key: $KEY" "http://localhost:8080/operator/jobs?limit=20"
+
+# Runtime settings UI (static page, no data — the JSON endpoints it calls are
+# gated by the same header): open http://<host>:8080/operator/settings and paste
+# the X-Operator-Key. Changing a threshold applies it LIVE to the next frames /
+# jobs / retention pass without a restart, and persists to
+# DATA_DIR/runtime_config.json across reboots.
+#   GET  /operator/settings        → the HTML page
+#   GET  /operator/settings.json   → schema + current/default values of the
+#                                   hot-tunable knobs
+#   POST /operator/settings.json   → {"set": {key: value, ...}} applies a patch
+#                                   (clamped + cross-field validated), or
+#                                   {"reset_all": true} restores the .env values
 ```
 
 The audit JSON contains `status` (`swapped` / `rejected` / `skipped` /

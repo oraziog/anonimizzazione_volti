@@ -4,6 +4,7 @@
 //! invalid values abort startup (fail-fast, consistent with the model policy).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -13,6 +14,9 @@ use crate::model_loader::ExecutionProvider;
 /// Filename (under `DATA_DIR`) of the nightly-retraining audit JSON, served
 /// by `GET /operator/retrain-audit`.
 pub const RETRAIN_AUDIT_FILENAME: &str = "retrain_audit.json";
+/// Filename (under `DATA_DIR`) of the persisted runtime-tunable overrides,
+/// edited through the operator settings UI (`GET/POST /operator/settings.json`).
+pub const RUNTIME_CONFIG_FILENAME: &str = "runtime_config.json";
 /// Running-classifier state (active ONNX + validated accuracy), so the
 /// operator can see what model is live and the A/B retraining gate can compare
 /// a candidate against the deployed accuracy.
@@ -701,6 +705,344 @@ impl Config {
             blur_sigma
         }
     }
+}
+
+// ─── Runtime-tunable configuration (operator settings UI) ───────────────────
+
+/// Input kind of a single runtime knob, used by the operator UI to pick the
+/// right widget (number slider/input, checkbox or `<select>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    Float,
+    Int,
+    Bool,
+    Enum,
+}
+
+/// Schema + current/default value of one hot-tunable knob, serialized as-is to
+/// `GET /operator/settings.json` so the browser renders the form from data
+/// (no matching server-side HTML template to keep).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FieldSpec {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub kind: FieldKind,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: Option<f64>,
+    pub options: Vec<&'static str>,
+    pub value: serde_json::Value,
+    pub default: serde_json::Value,
+}
+
+/// Hot-reloadable service configuration. Holds an `ArcSwap<Config>` (the
+/// *effective* snapshots every reader loads per job via `snapshot()`) plus an
+/// immutable record of the env-only defaults (for "reset to .env" and the UI's
+/// `default` column). Runtime overrides are persisted to `DATA_DIR/runtime_config.json`
+/// so a restart keeps the tuned values on top of the same env.
+pub struct RuntimeConfig {
+    inner: arc_swap::ArcSwap<Config>,
+    base: Arc<Config>,
+    overrides_file: Option<PathBuf>,
+}
+
+impl Clone for RuntimeConfig {
+    fn clone(&self) -> Self {
+        Self {
+            inner: arc_swap::ArcSwap::from_pointee(self.snapshot().as_ref().clone()),
+            base: self.base.clone(),
+            overrides_file: self.overrides_file.clone(),
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// Builds the effective config from the env, then applies
+    /// `DATA_DIR/runtime_config.json` (if present) on top. A corrupt/unknown
+    /// override aborts startup — the file is machine-written, a typo there is a
+    /// configuration error, not a runtime accident.
+    pub fn from_env() -> Result<Self> {
+        let base = Arc::new(Config::from_env()?);
+        let overrides_file = Some(base.data_dir.join(RUNTIME_CONFIG_FILENAME));
+        let mut effective = base.as_ref().clone();
+        if let Ok(text) = std::fs::read_to_string(&base.data_dir.join(RUNTIME_CONFIG_FILENAME)) {
+            let map: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&text).context("invalid runtime_config.json")?;
+            effective.apply_runtime_patch(&map)?;
+        }
+        Ok(Self {
+            inner: arc_swap::ArcSwap::from_pointee(effective),
+            base,
+            overrides_file,
+        })
+    }
+
+    /// A non-persisting handle for unit tests / fixed configurations.
+    #[allow(dead_code)] // only used from #[cfg(test)] modules and edge cases
+    pub fn fixed(cfg: Config) -> Self {
+        Self {
+            inner: arc_swap::ArcSwap::from_pointee(cfg.clone()),
+            base: Arc::new(cfg),
+            overrides_file: None,
+        }
+    }
+
+    /// Cheap snapshot of the effective config; callers pass `&cfg` to the
+    /// detections/pipeline and must not hold the guard across awaits.
+    pub fn snapshot(&self) -> Arc<Config> {
+        self.inner.load_full()
+    }
+
+    /// The env-only defaults (what the service would run with no overrides).
+    #[allow(dead_code)] // currently used internally via `field_specs`/reset paths
+    pub fn base(&self) -> Arc<Config> {
+        self.base.clone()
+    }
+
+    /// Applies a patch map (key → value) on top of the current effective
+    /// config, atomically swapping it in and persisting it. Only the keys
+    /// present in `patch` are changed; unknown keys are an error (fail-fast).
+    pub fn apply_patch(&self, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let mut next = self.inner.load_full().as_ref().clone();
+        next.apply_runtime_patch(patch)?;
+        let next = Arc::new(next);
+        self.inner.store(next.clone());
+        if let Some(path) = &self.overrides_file {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Atomic write-rename so a crash mid-write never leaves a corrupt
+            // overrides file that would fail the next startup.
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&next.runtime_values())?)?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(())
+    }
+
+    /// Resets a single knob back to its env default (or removes the whole
+    /// overrides file when `clear_all`).
+    pub fn reset_to_env(&self, key: &str, clear_all: bool) -> Result<()> {
+        let mut patch = serde_json::Map::new();
+        if clear_all {
+            if let Some(path) = &self.overrides_file {
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+            }
+            self.inner.store(self.base.clone());
+            return Ok(());
+        }
+        let value = self
+            .config_value(&self.base, key)
+            .ok_or_else(|| anyhow::anyhow!("unknown runtime setting '{key}'"))?;
+        patch.insert(key.to_string(), value);
+        self.apply_patch(&patch)
+    }
+
+    /// Reads one knob (optionally in the given origin) as a JSON value.
+    pub fn config_value(&self, cfg: &Config, key: &str) -> Option<serde_json::Value> {
+        Config::runtime_field_specs(cfg, cfg)
+            .into_iter()
+            .find(|f| f.key == key)
+            .map(|f| f.value)
+    }
+
+    /// Schema + effective/default values for the settings UI.
+    pub fn field_specs(&self) -> Vec<FieldSpec> {
+        Config::runtime_field_specs(&self.snapshot(), &self.base)
+    }
+}
+
+/// Standard knobs exposed by the operator settings UI.
+impl Config {
+    /// List of hot-tunable field specs for the settings UI (`current` builds
+    /// the effective values, `defaults` the "reset" baseline).
+    fn runtime_field_specs(current: &Config, defaults: &Config) -> Vec<FieldSpec> {
+        let f = |key, label, hint, kind, min, max, step, options: Vec<&'static str>| field_spec(
+            current,
+            defaults,
+            key,
+            label,
+            hint,
+            kind,
+            min,
+            max,
+            step,
+            options,
+        );
+        vec![
+            f("yolo_conf_threshold", "Soglia detector (LEARNING)",
+              "YOLO_CONF_THRESHOLD — confidenza minima dei volti accettati durante la fase di apprendimento.", FieldKind::Float, Some(0.01), Some(0.99), Some(0.01), vec![]),
+            f("yolo_conf_threshold_active", "Soglia detector (ACTIVE)",
+              "YOLO_CONF_THRESHOLD_ACTIVE — soglia dei volti da anonimizzare in tempo reale. Più bassa = più volti rilevati.", FieldKind::Float, Some(0.01), Some(0.99), Some(0.01), vec![]),
+            f("yolo_nms_iou", "NMS IoU",
+              "YOLO_NMS_IOU — soppressione dei riquadri sovrapposti.", FieldKind::Float, Some(0.05), Some(0.95), Some(0.05), vec![]),
+            f("fp_crop_conf_max", "FP_CROP_CONF_MAX",
+              "Confidenza massima sotto cui un riquadro viene considerato falso positivo e salvato nel dataset.", FieldKind::Float, Some(0.01), Some(0.99), Some(0.01), vec![]),
+            f("classifier_confirm_threshold", "Soglia conferma viso",
+              "CLASSIFIER_CONFIRM_THRESHOLD — probabilità minima del classificatore per confermare un viso.", FieldKind::Float, Some(0.01), Some(1.0), Some(0.01), vec![]),
+            f("classifier_enforce", "Classificatore obbligatorio",
+              "CLASSIFIER_ENFORCE — se ON, i visi sotto soglia non vengono anonimizzati.", FieldKind::Bool, None, None, None, vec![]),
+            f("anon_mode", "Modalità anonimizzazione",
+              "ANON_MODE — blur (sfocatura gaussiana) o pixelate (mosaico stile Street View).", FieldKind::Enum, None, None, None, vec!["blur", "pixelate"]),
+            f("pixelate_cell_px", "Dimensione cella mosaico",
+              "PIXELATE_CELL_PX — lato del blocco del pixelate in pixel.", FieldKind::Int, Some(2.0), Some(128.0), Some(1.0), vec![]),
+            f("initial_blur_sigma", "Sigma sfocatura",
+              "INITIAL_BLUR_SIGMA — intensità della sfocatura gaussiana di base.", FieldKind::Float, Some(1.0), Some(128.0), Some(1.0), vec![]),
+            f("blur_hull_margin_pct", "Margine hull (%)",
+              "BLUR_HULL_MARGIN_PCT — estensione percentuale della maschera intorno al contorno del viso.", FieldKind::Float, Some(0.0), Some(0.5), Some(0.01), vec![]),
+            f("blur_ellipse_margin", "Margine ellisse",
+              "BLUR_ELLIPSE_MARGIN — ingrandimento dell'ellisse del viso.", FieldKind::Float, Some(0.0), Some(0.5), Some(0.01), vec![]),
+            f("mask_feather_sigma", "Feather maschera",
+              "MASK_FEATHER_SIGMA — sfumatura del bordo della maschera (0 = come sigma sfocatura).", FieldKind::Float, Some(0.0), Some(64.0), Some(1.0), vec![]),
+            f("segmenter_min_box_px", "Min box segmenter",
+              "SEGMENTER_MIN_BOX — box sotto questa larghezza usa hull/ellisse geometrica invece del segmenter.", FieldKind::Float, Some(0.0), Some(512.0), Some(1.0), vec![]),
+            f("head_fallback_fraction", "Frazione testa (fallback)",
+              "HEAD_FALLBACK_FRACTION — frazione alta del box persona usata come regione testa.", FieldKind::Float, Some(0.05), Some(0.9), Some(0.05), vec![]),
+            f("jpeg_quality", "Qualità JPEG",
+              "JPEG_QUALITY — qualità di compressione degli output.", FieldKind::Int, Some(1.0), Some(100.0), Some(1.0), vec![]),
+            f("output_max_side_px", "Lato max output",
+              "OUTPUT_MAX_SIDE — ridimensiona il lato lungo dell'output (0 = off, ≥ 128).", FieldKind::Int, Some(0.0), Some(8192.0), Some(64.0), vec![]),
+        ]
+    }
+
+    /// Applies a validated set of runtime overrides to this config. Keys not in
+    /// the `runtime_field_specs` allowlist are an error (typo guard), values are
+    /// clamped the same way `from_env` clamps them, and cross-field invariants
+    /// (FP_CROP_CONF_MAX > YOLO_CONF_THRESHOLD) are re-checked afterwards.
+    pub fn apply_runtime_patch(&mut self, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        for (key, value) in patch {
+            match key.as_str() {
+                "yolo_conf_threshold" => self.yolo_conf_threshold = parse_float(key, value)?.clamp(0.01, 0.99),
+                "yolo_conf_threshold_active" => self.yolo_conf_threshold_active = parse_float(key, value)?.clamp(0.01, 0.99),
+                "yolo_nms_iou" => self.yolo_nms_iou = parse_float(key, value)?.clamp(0.05, 0.95),
+                "fp_crop_conf_max" => self.fp_crop_conf_max = parse_float(key, value)?.clamp(0.01, 0.99),
+                "classifier_confirm_threshold" => self.classifier_confirm_threshold = parse_float(key, value)?.clamp(0.01, 1.0),
+                "classifier_enforce" => self.classifier_enforce = parse_bool(key, value)?,
+                "anon_mode" => self.anon_mode = AnonMode::parse(&parse_string(key, value)?)?,
+                "pixelate_cell_px" => self.pixelate_cell_px = parse_int(key, value)?.clamp(2, 128),
+                "initial_blur_sigma" => self.initial_blur_sigma = parse_float(key, value)?.max(1.0),
+                "blur_hull_margin_pct" => self.blur_hull_margin_pct = parse_float(key, value)?.clamp(0.0, 0.5),
+                "blur_ellipse_margin" => self.blur_ellipse_margin = parse_float(key, value)?.clamp(0.0, 0.5),
+                "mask_feather_sigma" => self.mask_feather_sigma = parse_float(key, value)?.clamp(0.0, 64.0),
+                "segmenter_min_box_px" => self.segmenter_min_box_px = parse_float(key, value)?.max(0.0),
+                "head_fallback_fraction" => self.head_fallback_fraction = parse_float(key, value)?.clamp(0.05, 0.9),
+                "jpeg_quality" => self.jpeg_quality = parse_int(key, value)?.clamp(1, 100) as u8,
+                "output_max_side_px" => {
+                    let v = parse_int(key, value)?;
+                    if v != 0 && v < 128 {
+                        anyhow::bail!("output_max_side_px must be 0 or >= 128, got {v}");
+                    }
+                    self.output_max_side_px = v;
+                }
+                other => anyhow::bail!("unknown runtime setting '{other}'"),
+            }
+        }
+        if self.fp_crop_conf_max <= self.yolo_conf_threshold {
+            anyhow::bail!(
+                "FP_CROP_CONF_MAX ({}) must be > YOLO_CONF_THRESHOLD ({})",
+                self.fp_crop_conf_max,
+                self.yolo_conf_threshold
+            );
+        }
+        Ok(())
+    }
+
+    /// Serializes the current values of every runtime knob (the persisted
+    /// `runtime_config.json` shape — restores exactly this state on reboots).
+    pub fn runtime_values(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        for field in Self::runtime_field_specs(self, self) {
+            out.insert(field.key.to_string(), field.value);
+        }
+        out
+    }
+}
+
+fn field_spec(
+    current: &Config,
+    defaults: &Config,
+    key: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    kind: FieldKind,
+    min: Option<f64>,
+    max: Option<f64>,
+    step: Option<f64>,
+    options: Vec<&'static str>,
+) -> FieldSpec {
+    FieldSpec {
+        key,
+        label,
+        hint,
+        kind,
+        min,
+        max,
+        step,
+        options,
+        value: current_field_value(current, key),
+        default: current_field_value(defaults, key),
+    }
+}
+
+/// Extracts the current value of a runtime knob. Keys must stay in sync with
+/// `runtime_field_specs`.
+fn current_field_value(cfg: &Config, key: &str) -> serde_json::Value {
+    match key {
+        "yolo_conf_threshold" => serde_json::json!(cfg.yolo_conf_threshold),
+        "yolo_conf_threshold_active" => serde_json::json!(cfg.yolo_conf_threshold_active),
+        "yolo_nms_iou" => serde_json::json!(cfg.yolo_nms_iou),
+        "fp_crop_conf_max" => serde_json::json!(cfg.fp_crop_conf_max),
+        "classifier_confirm_threshold" => serde_json::json!(cfg.classifier_confirm_threshold),
+        "classifier_enforce" => serde_json::json!(cfg.classifier_enforce),
+        "anon_mode" => serde_json::json!(cfg.anon_mode.as_str()),
+        "pixelate_cell_px" => serde_json::json!(cfg.pixelate_cell_px),
+        "initial_blur_sigma" => serde_json::json!(cfg.initial_blur_sigma),
+        "blur_hull_margin_pct" => serde_json::json!(cfg.blur_hull_margin_pct),
+        "blur_ellipse_margin" => serde_json::json!(cfg.blur_ellipse_margin),
+        "mask_feather_sigma" => serde_json::json!(cfg.mask_feather_sigma),
+        "segmenter_min_box_px" => serde_json::json!(cfg.segmenter_min_box_px),
+        "head_fallback_fraction" => serde_json::json!(cfg.head_fallback_fraction),
+        "jpeg_quality" => serde_json::json!(cfg.jpeg_quality),
+        "output_max_side_px" => serde_json::json!(cfg.output_max_side_px),
+        _ => serde_json::Value::Null,
+    }
+}
+
+impl AnonMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnonMode::Blur => "blur",
+            AnonMode::Pixelate => "pixelate",
+        }
+    }
+}
+
+fn parse_float(key: &str, value: &serde_json::Value) -> Result<f32> {
+    value
+        .as_f64()
+        .map(|v| v as f32)
+        .ok_or_else(|| anyhow::anyhow!("{key}: expected a number"))
+}
+fn parse_int(key: &str, value: &serde_json::Value) -> Result<u32> {
+    value
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| anyhow::anyhow!("{key}: expected a positive integer"))
+}
+fn parse_bool(key: &str, value: &serde_json::Value) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("{key}: expected true/false"))
+}
+fn parse_string(key: &str, value: &serde_json::Value) -> Result<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("{key}: expected a string"))
 }
 
 #[cfg(test)]

@@ -29,6 +29,10 @@ in `src/README.md`.
 - **Code asincrone** — consumer **SQS** e **RabbitMQ** (feature `queue` /
   `rabbitmq`) sullo stesso worker S3: ack su successo, retry esponenziale e DLQ.
 - **Header X-Processing-Errors** + `<input>_error.txt` per report per-file.
+- **Hot-reload dei parametri runtime** — soglie di inferenza, modalità di
+  anonimizzazione e altri knob della pipeline sono modificabili a caldo tramite
+  la UI/API operatore `/operator/settings` (persistiti in
+  `DATA_DIR/runtime_config.json`, senza riavvio).
 - **GPU** — provider ONNX Runtime `cpu | cuda | tensorrt | directml`
   (feature cargo + `Dockerfile.gpu`), fail-fast se la GPU configurata non è
   utilizzabile.
@@ -109,6 +113,9 @@ longer shipped with the repository. The full operational reference lives in
   DLQ.
 - **X-Processing-Errors header** + `<input>_error.txt` for per-file error
   reporting.
+- **Hot-reload runtime parameters** — inference thresholds, anonymization mode
+  and other pipeline knobs can be changed live (no restart) via the operator
+  UI/API at `/operator/settings`, persisted to `DATA_DIR/runtime_config.json`.
 - **GPU** — ONNX Runtime providers `cpu | cuda | tensorrt | directml`
   (cargo feature + `Dockerfile.gpu`), fail-fast when the configured GPU is
   unusable.

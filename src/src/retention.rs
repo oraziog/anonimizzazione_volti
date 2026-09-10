@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, RuntimeConfig};
 use crate::zip_worker::{ArchiveEntryError, ZipJobOutcome};
 
 /// Newline-delimited JSON ledger of finished jobs (in `DATA_DIR`).
@@ -77,17 +77,19 @@ pub struct RetentionReport {
 
 /// Periodic STORE-output cleanup. Runs one pass immediately, then sleeps
 /// `RETENTION_INTERVAL_SECS` between passes (forever).
-pub async fn retention_loop(cfg: std::sync::Arc<Config>) {
+pub async fn retention_loop(runtime: RuntimeConfig) {
+    let snapshot = runtime.snapshot();
     tracing::info!(
         "STORE retention policy active: max_days={} max_gb={} interval={}s (min_age={}s)",
-        cfg.retention_max_days,
-        cfg.retention_max_gb,
-        cfg.retention_interval_secs,
-        cfg.retention_min_age_secs
+        snapshot.retention_max_days,
+        snapshot.retention_max_gb,
+        snapshot.retention_interval_secs,
+        snapshot.retention_min_age_secs
     );
     loop {
-        let cfg = cfg.clone();
-        let inner = cfg.clone();
+        let snapshot = runtime.snapshot();
+        let interval_secs = snapshot.retention_interval_secs;
+        let inner = snapshot;
         match tokio::task::spawn_blocking(move || run_retention(&inner)).await {
             Ok(Ok(report)) => tracing::info!(
                 "STORE retention pass: deleted {} files ({} bytes freed); {} output(s) remain ({} bytes)",
@@ -99,7 +101,7 @@ pub async fn retention_loop(cfg: std::sync::Arc<Config>) {
             Ok(Err(e)) => tracing::warn!("STORE retention pass failed: {e:#}"),
             Err(e) => tracing::error!("STORE retention worker panicked: {e}"),
         }
-        tokio::time::sleep(Duration::from_secs(cfg.retention_interval_secs)).await;
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }
 }
 

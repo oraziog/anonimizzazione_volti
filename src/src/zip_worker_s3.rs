@@ -241,7 +241,7 @@ impl S3ZipWorker {
             })
             .await;
 
-        let scratch = self.processor.data_dir().to_path_buf();
+        let scratch = self.processor.data_dir();
         let temp_in = scratch.join(format!("s3_{}.in", job_id));
         let outcome = self.process_one(job_id, input_key, output_key, &temp_in).await;
 
