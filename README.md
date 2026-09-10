@@ -73,3 +73,83 @@ Il sistema **non genera** il seed del classificatore: è esterno/mountato
 dataset YOLO o da WIDER FACE (verificare la licenza delle immagini prima
 dell'uso in produzione). `dataset_falsi_positivi/`, `dataset_seed/`,
 `.test-assets/` e i modelli ridimensionati sono esclusi dal repository.
+
+---
+
+# Anonimizzazione Volti — README (English)
+
+Batch face-anonymization service (Rust + ONNX) for fixed traffic/ZTL cameras,
+designed for GDPR compliance: **zero visibly-unblurred real faces in the
+output**, surgical precision via a binary classifier, and automatic per-camera
+region-of-interest (ROI) learning.
+
+This is an implementation of the Italian technical specification in
+`MD/anonimizzazione_volti.md`; its sections are referenced throughout the
+source. The detailed operational reference lives in `src/README.md`.
+
+## What it does
+
+- **Batch ingest** — `POST /anonymize` (zip/7z/rar, streamed to disk, never
+  buffered in RAM), `/anonymize/batch` for volumes beyond `BODY_LIMIT_BYTES`.
+- **Per-camera stateful pipeline (FSM)** — `INITIAL` → `LEARNING` → `ACTIVE`:
+  cautious full-frame blur, data collection, **ROI extraction** (DBSCAN →
+  convex hull), ROI gate + **binary classifier** + hull/ellipse mask of the
+  5 facial landmarks, "head" fallback for pure-profile shots.
+- **Nightly self-retraining** — PyO3 fine-tuning (MobileNetV2: seed + false
+  positives), ONNX export, Rust-side validation, A/B gate, atomic swap with
+  backup, operator-visible JSON audit.
+- **S3 storage backend** — asynchronous job intake from S3-compatible buckets
+  (MinIO / AWS / Spaces): job submission, output to a bucket, JSON audit logs,
+  **completion webhook with a 1-hour presigned URL**, operator batch sweep,
+  concurrency capped by `S3_MAX_CONCURRENT_JOBS`. Cargo feature `s3` (see
+  `src/docker-compose.minio.yml`).
+- **Async queues** — **SQS** and **RabbitMQ** consumers (features `queue` /
+  `rabbitmq`) driving the same S3 worker: ack on success, exponential retry,
+  DLQ.
+- **X-Processing-Errors header** + `<input>_error.txt` for per-file error
+  reporting.
+- **GPU** — ONNX Runtime providers `cpu | cuda | tensorrt | directml`
+  (cargo feature + `Dockerfile.gpu`), fail-fast when the configured GPU is
+  unusable.
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `src/` | Rust crate (build `cargo build --release` inside `src/`) |
+| `src/README.md` | Full documentation: architecture, API, config, S3, queues, measured tuning |
+| `src/docker-compose.yml` | Full stack with nightly retraining |
+| `src/docker-compose.minio.yml` | Stack + MinIO + S3 backend (feature `s3`) |
+| `src/docker-compose.gpu.yml` | Stack with ONNX Runtime CUDA (feature `cuda`) |
+| `src/python/` | `retrain.py` (nightly retraining), `prepare_seed.py` (classifier seed) |
+| `src/scripts/` | Test/exploration harnesses (`test-wider.ps1`, `eval_wider_output.py`, `blur_compare.py`, …) |
+| `MD/anonimizzazione_volti.md` | Technical specification |
+| `models_cache/` | ONNX models downloaded at runtime (git-ignored, see `.gitignore`) |
+
+## Quick start (S3 backend with MinIO)
+
+```bash
+cd src
+cp .env.example .env    # set S3_ENABLED=true + credentials
+docker compose -f docker-compose.minio.yml up -d --build
+
+./scripts/s3_tools.sh upload frame.zip camera_001.zip   # -> input bucket
+curl -X POST localhost:8080/anonymize/s3 \
+     -H 'Content-Type: application/json' \
+     -d '{"input_key":"camera_001.zip"}'
+curl localhost:8080/status/<JOB_ID>
+```
+
+S3 flow: downloads the archive from the input bucket → same `ZipProcessor` as
+the HTTP path → uploads `elaborati/<stem>_elaborato.zip` to the output bucket →
+writes a JSON audit log to the logs bucket → optional webhook with a presigned
+URL. On failure the input object is **moved** under `errori/` in the input
+bucket (so sweeps never re-pick it). Full details in `src/README.md`.
+
+## Data licensing
+
+The system **never generates** the classifier seed: it is external/mounted
+(`dataset_seed/real_faces`); `src/python/prepare_seed.py` builds it from a YOLO
+dataset or WIDER FACE (check the license of the images before shipping them
+into a production model). `dataset_falsi_positivi/`, `dataset_seed/`,
+`.test-assets/` and downloaded models are excluded from the repository.
