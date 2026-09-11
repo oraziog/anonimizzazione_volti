@@ -502,17 +502,9 @@ fn sample_images(dir: &Path, limit: usize) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    fn test_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "av_training_test_{tag}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Unique per run and removed on drop; see `crate::testutil`.
+    fn test_dir(tag: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("training_test_{tag}"))
     }
 
     #[test]

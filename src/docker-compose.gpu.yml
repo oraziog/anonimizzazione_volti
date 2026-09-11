@@ -22,7 +22,9 @@ services:
       # bound the arena with ORT_CUDA_MEMORY_LIMIT_BYTES.
       MAX_CONCURRENT_IMAGES: "8"
       CRON_RETRAIN_SCHEDULE: "03:00"    # HH:MM local
-      OPERATOR_API_KEY: "${OPERATOR_API_KEY:-change-me-operator-key}"
+      # No default on purpose: a known key would expose every operator route.
+      # `docker compose up` now fails fast until you set a real one in .env.
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:?OPERATOR_API_KEY is required - set a strong key in .env (see .env.example)}"
       ORT_EXECUTION_PROVIDER: cuda
       ORT_CUDA_DEVICE_ID: "${ORT_CUDA_DEVICE_ID:-0}"
       ORT_CUDA_MEMORY_LIMIT_BYTES: "${ORT_CUDA_MEMORY_LIMIT_BYTES:-}"  # e.g. 8589934592 (8 GiB)

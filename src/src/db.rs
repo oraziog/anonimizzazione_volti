@@ -109,6 +109,25 @@ impl Db {
         Ok(db)
     }
 
+    /// Close every pooled connection and wait for the file to be released.
+    ///
+    /// Dropping a `SqlitePool` only *schedules* the shutdown: the connections
+    /// (and, on Windows, the file handle) survive until the process exits
+    /// unless the pool is closed explicitly. Tests call this so their scratch
+    /// directory becomes removable while the process is still alive;
+    /// production never needs it, because the pool lives as long as the
+    /// service itself.
+    #[cfg(test)]
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    /// Test hook backing the `close` regression test.
+    #[cfg(test)]
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
     async fn migrate(&self) -> Result<()> {
         sqlx::query(
             r#"
@@ -467,32 +486,56 @@ fn row_to_camera(row: &sqlx::sqlite::SqliteRow) -> Camera {
 mod tests {
     use super::*;
 
-    async fn temp_db() -> Db {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "av_db_test_{}_{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Db::open(&dir.join("test.sqlite3")).await.unwrap()
+    /// Callers must `db.close().await` as their last statement: only an
+    /// explicit close releases the SQLite file, and until it is released the
+    /// scratch directory cannot be removed (the guard's delete is a no-op on
+    /// Windows, so the directory would survive the run).
+    async fn temp_db() -> (crate::testutil::TempDir, Db) {
+        let dir = crate::testutil::TempDir::new("db_test");
+        let db = Db::open(&dir.join("test.sqlite3")).await.unwrap();
+        (dir, db)
+    }
+
+    /// `Db::close` must really shut the pool down. Dropping a `Db` is *not*
+    /// enough: sqlx tears the connections down on a worker thread, and as long
+    /// as the SQLite handle is alive the scratch directory cannot be removed —
+    /// which is how thousands of them used to pile up under `%TEMP%` and how a
+    /// recycled pid made unrelated tests see stale state.
+    ///
+    /// The assertion is on the pool state, not on the directory: when Windows
+    /// actually releases the file depends on the machine (a virus scanner
+    /// re-opening a freshly written `.sqlite3` can hold it for seconds), so a
+    /// timing assertion here would flake. What the tests rely on is that the
+    /// close has been *issued and completed* before the guard runs.
+    #[tokio::test]
+    async fn close_shuts_the_pool_down() {
+        let dir = crate::testutil::TempDir::new("db_close");
+        let db = Db::open(&dir.join("test.sqlite3")).await.unwrap();
+        db.get_or_create_camera("CAM_001").await.unwrap();
+        assert!(!db.is_closed(), "a freshly opened pool is open");
+
+        db.close().await;
+
+        assert!(db.is_closed(), "close() must shut the pool down");
+        // A closed pool refuses new work instead of quietly reopening the file.
+        assert!(db.all_cameras().await.is_err());
     }
 
     #[tokio::test]
     async fn unknown_camera_gets_learning_state() {
-        let db = temp_db().await;
+        let (_dir, db) = temp_db().await;
         let cam = db.get_or_create_camera("CAM_001").await.unwrap();
         assert_eq!(cam.state, CameraState::Learning);
         assert!(cam.learning_started_at.is_some());
         // Second read must not re-create or change state.
         let cam2 = db.get_or_create_camera("CAM_001").await.unwrap();
         assert_eq!(cam2.state, CameraState::Learning);
+        db.close().await;
     }
 
     #[tokio::test]
     async fn fsm_transitions_and_detections_roundtrip() {
-        let db = temp_db().await;
+        let (_dir, db) = temp_db().await;
         db.get_or_create_camera("CAM_002").await.unwrap();
         db.insert_detections(&[
             Detection {
@@ -530,11 +573,12 @@ mod tests {
         let cam = db.camera_by_id("CAM_002").await.unwrap().unwrap();
         assert_eq!(cam.state, CameraState::Initial);
         assert!(cam.roi_json.is_none());
+        db.close().await;
     }
 
     #[tokio::test]
     async fn s3_job_rows_roundtrip_and_upsert() {
-        let db = temp_db().await;
+        let (_dir, db) = temp_db().await;
         let row = S3JobRow {
             job_id: "job-1".into(),
             input_key: "cam.zip".into(),
@@ -574,11 +618,12 @@ mod tests {
 
         // Unknown id → None.
         assert!(db.job_get("nope").await.unwrap().is_none());
+        db.close().await;
     }
 
     #[tokio::test]
     async fn detections_since_and_pruning() {
-        let db = temp_db().await;
+        let (_dir, db) = temp_db().await;
         db.get_or_create_camera("CAM_003").await.unwrap();
         let now = Utc::now();
         db.insert_detections(&[
@@ -609,5 +654,6 @@ mod tests {
         let removed = db.prune_detections_older_than(&cutoff).await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(db.detections_for_camera("CAM_003").await.unwrap().len(), 1);
+        db.close().await;
     }
 }

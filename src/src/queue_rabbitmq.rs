@@ -33,7 +33,7 @@ use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 
 use crate::config::RabbitMqSettings;
 use crate::queue_metrics::QueueMetrics;
-use crate::zip_worker_s3::{QueueJobMessage, S3ZipWorker};
+use crate::zip_worker_s3::{safe_job_id, QueueJobMessage, S3ZipWorker};
 
 /// Runs the consumer forever. Declares the queue topology, then consumes with
 /// manual acks. Returns only on an irrecoverable connection/channel error.
@@ -47,7 +47,7 @@ pub async fn run_consumer(
         ConnectionProperties::default().with_connection_name("anonimizzazione-consumer".into()),
     )
     .await
-    .with_context(|| format!("connect to RabbitMQ at {}", settings.url))?;
+    .with_context(|| format!("connect to RabbitMQ at {}", redact_amqp_url(&settings.url)))?;
     let channel = conn.create_channel().await.context("create AMQP channel")?;
     channel
         .basic_qos(settings.prefetch, BasicQosOptions::default())
@@ -59,7 +59,7 @@ pub async fn run_consumer(
 
     tracing::info!(
         "RabbitMQ consumer ready: url={} queue={} retry={} dlq={} (prefetch {}, max {} retries)",
-        settings.url,
+        redact_amqp_url(&settings.url),
         settings.queue,
         retry_queue,
         settings.dlq,
@@ -171,9 +171,34 @@ async fn handle_delivery(
     metrics: &Arc<QueueMetrics>,
     delivery: lapin::message::Delivery,
 ) -> Result<()> {
+    // The `message_id` is producer-controlled and becomes a path component
+    // (`DATA_DIR/s3_<id>.in`), an audit object key and part of log lines: an
+    // unsafe value is rejected outright (fail-closed, straight to the DLQ)
+    // instead of being used. `{:?}` on the raw value escapes CR/LF so a
+    // hostile id cannot forge log entries while being rejected.
     let job_id = match delivery.properties.message_id() {
-        Some(id) => id.to_string(),
         None => uuid::Uuid::new_v4().to_string(),
+        Some(id) => match safe_job_id(id.as_str()) {
+            Some(safe) => safe.to_string(),
+            None => {
+                tracing::error!(
+                    "RabbitMQ message with unsafe message_id {id:?} rejected, sending to DLQ"
+                );
+                metrics.dlq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                publish(
+                    channel,
+                    &settings.dlq,
+                    &delivery.data,
+                    delivery.properties.clone(),
+                )
+                .await?;
+                delivery
+                    .ack(BasicAckOptions::default())
+                    .await
+                    .context("ack message with unsafe id")?;
+                return Ok(());
+            }
+        },
     };
 
     let payload: QueueJobMessage = match serde_json::from_slice(&delivery.data) {
@@ -291,6 +316,21 @@ fn x_death_attempts(props: &BasicProperties) -> u32 {
 }
 
 /// Publishes `body` to the default exchange with `routing_key` = queue name.
+/// Redacts the userinfo of an AMQP URL so credentials never reach the logs:
+/// `amqp://user:pass@host:5672/vhost` → `amqp://***@host:5672/vhost`.
+pub fn redact_amqp_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    // The authority ends at the first '/', '?' or '#'.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_string(),
+    }
+}
+
 async fn publish(channel: &Channel, queue: &str, body: &[u8], props: BasicProperties) -> Result<()> {
     channel
         .basic_publish(
@@ -364,5 +404,25 @@ mod tests {
         );
         let props = BasicProperties::default().with_headers(headers);
         assert_eq!(x_death_attempts(&props), 0);
+    }
+
+    /// The connection URL carries user:pass — it must never be logged verbatim.
+    #[test]
+    fn amqp_urls_are_logged_without_credentials() {
+        assert_eq!(
+            redact_amqp_url("amqp://user:pass@broker:5672/vhost"),
+            "amqp://***@broker:5672/vhost"
+        );
+        assert_eq!(redact_amqp_url("amqps://u:p@broker"), "amqps://***@broker");
+        assert_eq!(
+            redact_amqp_url("amqp://u:p@broker:5672/v?heartbeat=60"),
+            "amqp://***@broker:5672/v?heartbeat=60"
+        );
+        // No credentials (or not a URL at all) → unchanged, never panics.
+        assert_eq!(
+            redact_amqp_url("amqp://127.0.0.1:5672"),
+            "amqp://127.0.0.1:5672"
+        );
+        assert_eq!(redact_amqp_url("nonsense"), "nonsense");
     }
 }

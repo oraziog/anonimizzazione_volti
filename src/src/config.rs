@@ -23,11 +23,53 @@ pub const RUNTIME_CONFIG_FILENAME: &str = "runtime_config.json";
 #[allow(dead_code)] // only referenced by the optional retraining feature
 pub const CLASSIFIER_STATE_FILENAME: &str = "classifier_state.json";
 
+/// `OPERATOR_API_KEY` wrapper whose `Debug` is redacted: a stray `{:?}` on the
+/// whole `Config` (or on this field) can never print the secret. Note the
+/// `PartialEq` derive is for tests only — authentication never compares the
+/// strings directly (the gate hashes both sides and compares in constant time,
+/// see `secret_eq` in `main.rs`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperatorKey(Option<String>);
+
+impl OperatorKey {
+    pub fn new(raw: Option<String>) -> Self {
+        Self(raw)
+    }
+
+    /// The configured key, or `None` when operator endpoints are disabled.
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl std::fmt::Debug for OperatorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(_) => f.write_str("OperatorKey(<redacted>)"),
+            None => f.write_str("OperatorKey(none)"),
+        }
+    }
+}
+
 /// Fully-parsed service configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
     pub body_limit_bytes: usize,
+    /// Deadline for the **upload phase** of a request in seconds (env
+    /// `REQUEST_TIMEOUT_SECS`, default 3600, 0 = disabled).
+    ///
+    /// It bounds only how long a client may take to deliver its body (the
+    /// multipart header read and the archive transfer; for `/anonymize/batch`
+    /// one shared budget covers all the archives of the request).
+    /// **Processing time is not counted**: a job that takes hours still
+    /// completes, because the timer is applied around the body reads rather
+    /// than around the whole handler.
+    ///
+    /// The reason it exists: the global single-job lock is taken *before* the
+    /// upload is spooled, so without a deadline one client that dribbles its
+    /// body keeps every other client out (slowloris DoS).
+    pub request_timeout_secs: u64,
     pub max_concurrent_images: Option<usize>,
     pub jpeg_quality: u8,
 
@@ -145,7 +187,7 @@ pub struct Config {
     #[allow(dead_code)] // consumed by the optional retraining feature
     pub retrain_batch_size: u32,
 
-    pub operator_api_key: Option<String>,
+    pub operator_api_key: OperatorKey,
 
     // STORE-output retention (DATA_DIR `*_elaborato.zip` cleanup).
     pub retention_enabled: bool,
@@ -155,6 +197,49 @@ pub struct Config {
     /// Outputs modified more recently than this are never deleted (in-flight
     /// jobs / responses streaming right now).
     pub retention_min_age_secs: u64,
+
+    // ── Hardening: archive / ingest limits (zip-bomb & DoS guards) ────────
+    // Every value is a *cap*: 0 disables that specific check. The defaults
+    // are generous for real image batches and still stop an amplification or
+    // exhaustion attempt.
+    /// Max entries accepted in a single archive (0 = unlimited).
+    pub max_entries_per_archive: usize,
+    /// Max bytes of a single decompressed entry (0 = unlimited).
+    pub max_entry_bytes: u64,
+    /// Max total decompressed bytes per archive (0 = unlimited).
+    pub max_total_uncompressed_bytes: u64,
+    /// Max uncompressed/compressed ratio per entry (0 = unlimited). A *spike*
+    /// detector, not the main bound: `MAX_ENTRY_BYTES`/`MAX_TOTAL_*` already cap
+    /// how much a hostile archive can make us allocate. The default (500) sits
+    /// above even a heavily redundant scanned/bilevel image entry, so it only
+    /// trips on deliberate amplification. Measured on the repo's own mixed
+    /// archive: a 405 KB text entry deflates 1875x, which is why this knob must
+    /// not be set at "a few hundred" without checking the workload.
+    pub max_compression_ratio: u64,
+    /// Image decode bounds handed to `image::Limits` (0 = unlimited).
+    pub max_image_width: u32,
+    pub max_image_height: u32,
+    pub max_image_alloc_bytes: u64,
+    /// Batch/upload volume caps (0 = unlimited).
+    pub max_archives_per_batch: usize,
+    pub max_archive_bytes: u64,
+    pub max_batch_total_bytes: u64,
+
+    // ── Hardening: model download policy ─────────────────────────────────
+    /// Allow plain `http://` model URLs (default false: `https://` only, so a
+    /// MITM cannot swap the ONNX the runtime parses).
+    pub model_allow_http: bool,
+    /// Refuse to download/start when no `MODEL_*_SHA256` is configured.
+    pub model_sha_required: bool,
+    /// Max redirects followed while downloading a model (0 = none).
+    pub model_max_redirects: usize,
+
+    // ── Hardening: S3 ingest ─────────────────────────────────────────────
+    /// Require the operator key on `/anonymize/s3` and `/status/:job_id`
+    /// (env `S3_INGEST_AUTH_REQUIRED`, default true). Only consulted by the
+    /// `s3` feature routes.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    pub s3_ingest_auth_required: bool,
 
     // Inference execution provider (env `ORT_EXECUTION_PROVIDER`, default
     // `cpu`): which ONNX Runtime EP every session is built with. The GPU EPs
@@ -211,6 +296,13 @@ pub struct S3Settings {
     /// (env `S3_WEBHOOK_ALLOWED_HOSTS`, comma-separated). Empty = webhooks
     /// rejected at submit time (anti-{SSRF,abuse} default).
     pub webhook_allowed_hosts: Vec<String>,
+    /// Honour `delete_input_on_success` carried by a queue message (env
+    /// `S3_TRUST_MESSAGE_DELETE`, default false). A message is attacker-
+    /// controlled data, so it must not be able to delete bucket objects unless
+    /// the operator explicitly opts in. Same env/default as
+    /// `Config::s3_trust_message_delete` (kept here because the worker only
+    /// sees `S3Settings`).
+    pub trust_message_delete: bool,
 }
 
 /// SQS consumer settings (feature `queue`, spec §8 "Scenario S3" extended).
@@ -345,6 +437,7 @@ fn s3_settings_from_env() -> Result<Option<S3Settings>> {
         bucket_logs: env_str("S3_BUCKET_LOGS", "anonimizzazione-logs"),
         max_concurrent_jobs,
         webhook_allowed_hosts,
+        trust_message_delete: env_parse("S3_TRUST_MESSAGE_DELETE", false)?,
     };
 
     for (name, v) in [
@@ -571,6 +664,7 @@ impl Config {
         let cfg = Self {
             bind_addr: env_str("BIND_ADDR", "0.0.0.0:8080"),
             body_limit_bytes: env_parse("BODY_LIMIT_BYTES", 3_758_096_384usize)?,
+            request_timeout_secs: env_parse("REQUEST_TIMEOUT_SECS", 3600u64)?,
             max_concurrent_images,
             jpeg_quality: env_parse::<u8>("JPEG_QUALITY", 95)?.clamp(1, 100),
 
@@ -646,13 +740,33 @@ impl Config {
             retrain_epochs: env_parse::<u32>("RETRAIN_EPOCHS", 5)?.max(1),
             retrain_batch_size: env_parse::<u32>("RETRAIN_BATCH_SIZE", 32)?.max(1),
 
-            operator_api_key: env_opt("OPERATOR_API_KEY"),
+            operator_api_key: OperatorKey::new(env_opt("OPERATOR_API_KEY")),
 
             retention_enabled: env_parse::<bool>("RETENTION_ENABLED", true)?,
             retention_max_days: env_parse::<u32>("RETENTION_MAX_DAYS", 30)?,
             retention_max_gb: env_parse::<f64>("RETENTION_MAX_GB", 20.0)?,
             retention_interval_secs: env_parse::<u64>("RETENTION_INTERVAL_SECS", 3600)?.max(60),
             retention_min_age_secs: env_parse::<u64>("RETENTION_MIN_AGE_SECS", 1800)?,
+
+            max_entries_per_archive: env_parse("MAX_ENTRIES_PER_ARCHIVE", 100_000usize)?,
+            max_entry_bytes: env_parse("MAX_ENTRY_BYTES", 209_715_200u64)?,
+            max_total_uncompressed_bytes: env_parse(
+                "MAX_TOTAL_UNCOMPRESSED_BYTES",
+                8_589_934_592u64,
+            )?,
+            max_compression_ratio: env_parse("MAX_COMPRESSION_RATIO", 500u64)?,
+            max_image_width: env_parse("MAX_IMAGE_WIDTH", 20_000u32)?,
+            max_image_height: env_parse("MAX_IMAGE_HEIGHT", 20_000u32)?,
+            max_image_alloc_bytes: env_parse("MAX_IMAGE_ALLOC_BYTES", 536_870_912u64)?,
+            max_archives_per_batch: env_parse("MAX_ARCHIVES_PER_BATCH", 64usize)?,
+            max_archive_bytes: env_parse("MAX_ARCHIVE_BYTES", 3_758_096_384u64)?,
+            max_batch_total_bytes: env_parse("MAX_BATCH_TOTAL_BYTES", 10_737_418_240u64)?,
+
+            model_allow_http: env_parse("MODEL_ALLOW_HTTP", false)?,
+            model_sha_required: env_parse("MODEL_SHA_REQUIRED", false)?,
+            model_max_redirects: env_parse("MODEL_MAX_REDIRECTS", 2usize)?,
+
+            s3_ingest_auth_required: env_parse("S3_INGEST_AUTH_REQUIRED", true)?,
 
             execution_provider: ExecutionProvider::parse(&env_str(
                 "ORT_EXECUTION_PROVIDER",
@@ -677,7 +791,51 @@ impl Config {
         if cfg.fp_crop_conf_max <= cfg.yolo_conf_threshold {
             anyhow::bail!("FP_CROP_CONF_MAX must be > YOLO_CONF_THRESHOLD");
         }
+        cfg.validate_finite()?;
         Ok(cfg)
+    }
+
+    /// Rejects non-finite float knobs (`NaN`, `inf`). `f32::from_str`/
+    /// `f64::from_str` accept the literals "NaN"/"inf", and neither `clamp`
+    /// nor `max` drops NaN — it would silently poison blur sigma, thresholds
+    /// and ratio checks. The env is operator-controlled, so this turns a typo
+    /// into a startup error instead of a degraded (or DoS-prone) pipeline.
+    fn validate_finite(&self) -> Result<()> {
+        let checks: [(&str, f64); 21] = [
+            ("HEAD_FALLBACK_FRACTION", self.head_fallback_fraction as f64),
+            ("SEGMENTER_MIN_BOX", self.segmenter_min_box_px as f64),
+            ("YOLO_CONF_THRESHOLD", self.yolo_conf_threshold as f64),
+            (
+                "YOLO_CONF_THRESHOLD_ACTIVE",
+                self.yolo_conf_threshold_active as f64,
+            ),
+            ("YOLO_NMS_IOU", self.yolo_nms_iou as f64),
+            ("FP_CROP_CONF_MAX", self.fp_crop_conf_max as f64),
+            ("INITIAL_BLUR_SIGMA", self.initial_blur_sigma as f64),
+            ("BLUR_HULL_MARGIN_PCT", self.blur_hull_margin_pct as f64),
+            ("BLUR_ELLIPSE_MARGIN", self.blur_ellipse_margin as f64),
+            ("MASK_FEATHER_SIGMA", self.mask_feather_sigma as f64),
+            (
+                "CLASSIFIER_CONFIRM_THRESHOLD",
+                self.classifier_confirm_threshold as f64,
+            ),
+            ("ROI_EPS_PX", self.roi_eps_px as f64),
+            ("ROI_RDP_EPSILON", self.roi_rdp_epsilon as f64),
+            ("ROI_AREA_MIN", self.roi_area_min),
+            ("ROI_AREA_MAX", self.roi_area_max),
+            ("ROI_MARGIN_PCT", self.roi_margin_pct),
+            ("ROI_REEXTRACT_MIN_IOU", self.roi_reextract_min_iou),
+            ("RETRAIN_MIN_ACCURACY", self.retrain_min_accuracy as f64),
+            ("RETRAIN_REGRESSION_EPS", self.retrain_regression_eps as f64),
+            ("RETRAIN_HOLDOUT_FRACTION", self.retrain_holdout_fraction as f64),
+            ("RETENTION_MAX_GB", self.retention_max_gb),
+        ];
+        for (name, value) in checks {
+            if !value.is_finite() {
+                anyhow::bail!("{name} must be a finite number, got {value}");
+            }
+        }
+        Ok(())
     }
 
     /// Effective per-image concurrency: env override, else auto-detected
@@ -726,6 +884,8 @@ pub enum FieldKind {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FieldSpec {
     pub key: &'static str,
+    /// Backing `.env` variable (the startup default this knob overrides).
+    pub env: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
     pub kind: FieldKind,
@@ -743,7 +903,13 @@ pub struct FieldSpec {
 /// `default` column). Runtime overrides are persisted to `DATA_DIR/runtime_config.json`
 /// so a restart keeps the tuned values on top of the same env.
 pub struct RuntimeConfig {
-    inner: arc_swap::ArcSwap<Config>,
+    /// Shared, hot-swappable effective config. Every clone points at the same
+    /// `ArcSwap`, so an operator patch applied on *any* handle (the settings
+    /// UI's) is immediately visible to every consumer (the ZipProcessor, the
+    /// retention/background loops) — `ArcSwap` itself is not `Clone`, sharing it
+    /// behind an `Arc` makes `RuntimeConfig::clone` an O(1) refcount bump
+    /// instead of a deep `Config` copy.
+    inner: Arc<arc_swap::ArcSwap<Config>>,
     base: Arc<Config>,
     overrides_file: Option<PathBuf>,
 }
@@ -751,7 +917,7 @@ pub struct RuntimeConfig {
 impl Clone for RuntimeConfig {
     fn clone(&self) -> Self {
         Self {
-            inner: arc_swap::ArcSwap::from_pointee(self.snapshot().as_ref().clone()),
+            inner: self.inner.clone(),
             base: self.base.clone(),
             overrides_file: self.overrides_file.clone(),
         }
@@ -767,13 +933,13 @@ impl RuntimeConfig {
         let base = Arc::new(Config::from_env()?);
         let overrides_file = Some(base.data_dir.join(RUNTIME_CONFIG_FILENAME));
         let mut effective = base.as_ref().clone();
-        if let Ok(text) = std::fs::read_to_string(&base.data_dir.join(RUNTIME_CONFIG_FILENAME)) {
+        if let Ok(text) = std::fs::read_to_string(base.data_dir.join(RUNTIME_CONFIG_FILENAME)) {
             let map: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&text).context("invalid runtime_config.json")?;
             effective.apply_runtime_patch(&map)?;
         }
         Ok(Self {
-            inner: arc_swap::ArcSwap::from_pointee(effective),
+            inner: Arc::new(arc_swap::ArcSwap::from_pointee(effective)),
             base,
             overrides_file,
         })
@@ -783,7 +949,7 @@ impl RuntimeConfig {
     #[allow(dead_code)] // only used from #[cfg(test)] modules and edge cases
     pub fn fixed(cfg: Config) -> Self {
         Self {
-            inner: arc_swap::ArcSwap::from_pointee(cfg.clone()),
+            inner: Arc::new(arc_swap::ArcSwap::from_pointee(cfg.clone())),
             base: Arc::new(cfg),
             overrides_file: None,
         }
@@ -962,6 +1128,34 @@ impl Config {
     }
 }
 
+/// `.env` variable backing each hot-tunable knob. Kept explicit because the key
+/// is a UI identifier while the env name is what operators actually set (they
+/// are not always derivable: `segmenter_min_box_px` → `SEGMENTER_MIN_BOX`).
+/// Must stay in sync with `runtime_field_specs`; the docs guard test fails
+/// otherwise.
+fn runtime_env_name(key: &str) -> &'static str {
+    match key {
+        "yolo_conf_threshold" => "YOLO_CONF_THRESHOLD",
+        "yolo_conf_threshold_active" => "YOLO_CONF_THRESHOLD_ACTIVE",
+        "yolo_nms_iou" => "YOLO_NMS_IOU",
+        "fp_crop_conf_max" => "FP_CROP_CONF_MAX",
+        "classifier_confirm_threshold" => "CLASSIFIER_CONFIRM_THRESHOLD",
+        "classifier_enforce" => "CLASSIFIER_ENFORCE",
+        "anon_mode" => "ANON_MODE",
+        "pixelate_cell_px" => "PIXELATE_CELL_PX",
+        "initial_blur_sigma" => "INITIAL_BLUR_SIGMA",
+        "blur_hull_margin_pct" => "BLUR_HULL_MARGIN_PCT",
+        "blur_ellipse_margin" => "BLUR_ELLIPSE_MARGIN",
+        "mask_feather_sigma" => "MASK_FEATHER_SIGMA",
+        "segmenter_min_box_px" => "SEGMENTER_MIN_BOX",
+        "head_fallback_fraction" => "HEAD_FALLBACK_FRACTION",
+        "jpeg_quality" => "JPEG_QUALITY",
+        "output_max_side_px" => "OUTPUT_MAX_SIDE",
+        _ => "",
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // internal builder; the `f` closure keeps the 16 call sites compact
 fn field_spec(
     current: &Config,
     defaults: &Config,
@@ -976,6 +1170,7 @@ fn field_spec(
 ) -> FieldSpec {
     FieldSpec {
         key,
+        env: runtime_env_name(key),
         label,
         hint,
         kind,
@@ -1022,10 +1217,13 @@ impl AnonMode {
 }
 
 fn parse_float(key: &str, value: &serde_json::Value) -> Result<f32> {
-    value
+    let v = value
         .as_f64()
-        .map(|v| v as f32)
-        .ok_or_else(|| anyhow::anyhow!("{key}: expected a number"))
+        .ok_or_else(|| anyhow::anyhow!("{key}: expected a number"))?;
+    if !v.is_finite() {
+        anyhow::bail!("{key}: expected a finite number");
+    }
+    Ok(v as f32)
 }
 fn parse_int(key: &str, value: &serde_json::Value) -> Result<u32> {
     value
@@ -1053,6 +1251,7 @@ impl Config {
         Config {
             bind_addr: "127.0.0.1:0".into(),
             body_limit_bytes: 3_758_096_384,
+            request_timeout_secs: 0,
             max_concurrent_images: Some(2),
             jpeg_quality: 95,
             yolo_model_url: String::new(),
@@ -1103,12 +1302,26 @@ impl Config {
             retrain_holdout_fraction: 0.10,
             retrain_epochs: 1,
             retrain_batch_size: 8,
-            operator_api_key: None,
+            operator_api_key: OperatorKey::new(None),
             retention_enabled: false, // tests create their own temp data dirs
             retention_max_days: 30,
             retention_max_gb: 20.0,
             retention_interval_secs: 3600,
             retention_min_age_secs: 1800,
+            max_entries_per_archive: 100_000,
+            max_entry_bytes: 209_715_200,
+            max_total_uncompressed_bytes: 8_589_934_592,
+            max_compression_ratio: 500,
+            max_image_width: 20_000,
+            max_image_height: 20_000,
+            max_image_alloc_bytes: 536_870_912,
+            max_archives_per_batch: 64,
+            max_archive_bytes: 3_758_096_384,
+            max_batch_total_bytes: 10_737_418_240,
+            model_allow_http: false,
+            model_sha_required: false,
+            model_max_redirects: 2,
+            s3_ingest_auth_required: true,
             execution_provider: ExecutionProvider::Cpu,
             gpu_device_id: 0,
             gpu_memory_limit_bytes: None,
@@ -1205,6 +1418,55 @@ mod tests {
         std::env::remove_var("CLASSIFIER_CONFIRM_THRESHOLD");
     }
 
+    /// `f32::from_str` accepts "NaN"/"inf" and neither `clamp` nor `max`
+    /// drops NaN — a typo in the env must fail loudly instead of poisoning
+    /// the pipeline.
+    #[test]
+    fn non_finite_floats_are_rejected() {
+        let cfg = Config::test_default();
+        cfg.validate_finite().unwrap();
+
+        let mut nan_sigma = Config::test_default();
+        nan_sigma.initial_blur_sigma = f32::NAN;
+        assert!(nan_sigma.validate_finite().is_err());
+
+        let mut inf_gb = Config::test_default();
+        inf_gb.retention_max_gb = f64::INFINITY;
+        assert!(inf_gb.validate_finite().is_err());
+
+        let mut nan_iou = Config::test_default();
+        nan_iou.roi_reextract_min_iou = f64::NAN;
+        assert!(nan_iou.validate_finite().is_err());
+    }
+
+    /// A runtime patch never accepts a non-numeric value; JSON itself cannot
+    /// carry NaN/inf, so the finite guard in `parse_float` is belt-and-braces.
+    #[test]
+    fn runtime_patch_rejects_non_numeric() {
+        let mut cfg = Config::test_default();
+        let mut patch = serde_json::Map::new();
+        patch.insert("initial_blur_sigma".to_string(), serde_json::Value::Null);
+        assert!(cfg.apply_runtime_patch(&patch).is_err());
+        patch.insert("unknown_knob".to_string(), serde_json::json!(1.0));
+        assert!(cfg.apply_runtime_patch(&patch).is_err());
+    }
+
+    /// The operator key must never reach a log line, not even through a `{:?}`
+    /// on the whole `Config`.
+    #[test]
+    fn operator_key_debug_is_redacted() {
+        let key = OperatorKey::new(Some("super-secret".to_string()));
+        let dbg = format!("{key:?}");
+        assert!(!dbg.contains("super-secret"), "key leaked in {dbg}");
+        assert!(dbg.contains("redacted"), "unexpected Debug: {dbg}");
+        assert_eq!(key.as_deref(), Some("super-secret"));
+
+        let mut cfg = Config::test_default();
+        cfg.operator_api_key = OperatorKey::new(Some("super-secret".to_string()));
+        assert!(!format!("{cfg:?}").contains("super-secret"));
+        assert!(format!("{:?}", Config::test_default()).contains("none"));
+    }
+
     #[test]
     fn mask_feather_mode() {
         let cfg = Config::test_default();
@@ -1215,6 +1477,36 @@ mod tests {
         capped.mask_feather_sigma = 8.0;
         assert_eq!(capped.mask_feather(37.5), 8.0);
         assert_eq!(capped.mask_feather(5.0), 5.0); // small faces: sigma wins
+    }
+
+    /// Guard against documentation drift: every hot-tunable knob must have a
+    /// backing `.env` variable *and* be documented in `.env.example`, so a new
+    /// runtime knob cannot ship undocumented. The operator UI serves the same
+    /// names via `GET /operator/settings.json`.
+    #[test]
+    fn runtime_knobs_are_documented_in_env_example() {
+        let cfg = Config::test_default();
+        let specs = Config::runtime_field_specs(&cfg, &cfg);
+        assert!(
+            specs.len() >= 16,
+            "expected the runtime knob set, got {}",
+            specs.len()
+        );
+        let doc = std::fs::read_to_string(".env.example")
+            .expect(".env.example must exist at the crate root");
+        for f in &specs {
+            assert!(
+                !f.env.is_empty(),
+                "runtime knob '{}' has no .env mapping: add it to runtime_env_name",
+                f.key
+            );
+            assert!(
+                doc.contains(f.env),
+                "runtime knob '{}' is not documented in .env.example as {}",
+                f.key,
+                f.env
+            );
+        }
     }
 
     #[test]

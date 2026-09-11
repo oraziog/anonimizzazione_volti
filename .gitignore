@@ -2,3 +2,9 @@
 /target
 /Cargo.lock
 Cargo.lock.bak
+
+# Generated sample outputs (anonymized demo images — never commit)
+src/docs/images/sample_outputs/
+
+# Staging folder for README images (source copies live in src/docs/images)
+New folder/

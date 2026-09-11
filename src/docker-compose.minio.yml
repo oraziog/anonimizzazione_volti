@@ -74,7 +74,9 @@ services:
       S3_MAX_CONCURRENT_JOBS: "2"
       # Completion webhooks are OFF unless an allowlist host is set (anti-SSRF).
       # S3_WEBHOOK_ALLOWED_HOSTS: "notifiche.internal:8443, altro.example"
-      OPERATOR_API_KEY: "${OPERATOR_API_KEY:-change-me-operator-key}"
+      # No default on purpose: a known key would expose every operator route.
+      # `docker compose up` now fails fast until you set a real one in .env.
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:?OPERATOR_API_KEY is required - set a strong key in .env (see .env.example)}"
       RUST_LOG: info
     ports:
       - "8080:8080"

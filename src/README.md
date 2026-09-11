@@ -1,5 +1,9 @@
 # Anonimizzazione Volti — batch face-anonymization service (Rust + ONNX)
 
+<p align="center">
+  <img src="docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
+</p>
+
 Industrial-grade microservice that anonymizes (blurs) faces in batches of images
 captured by fixed traffic/ZTL cameras, targeting GDPR compliance: **zero
 visibly-unblurred real faces in the output**, surgical precision via a binary
@@ -24,6 +28,10 @@ artifact and is no longer shipped with the repository.
 | `src/training.rs` + `python/retrain.py` | Optional nightly PyO3 retraining bridge: fine-tune + ONNX export + pre-swap validation + backup + JSON audit |
 | `src/eval_wider.rs` / `src/eval_fddb.rs` | Offline CLI evaluation of the detector against WIDER FACE / FDDB ground truth (AP, precision/recall, recall vs FP-per-image) |
 | `python/prepare_seed.py` | Classifier-seed builder: crops face boxes from a YOLO dataset or from WIDER FACE (difficulty-filtered) |
+
+### Workflow
+
+![Flusso di lavoro: ingest dell'archivio, FSM per camera, pipeline di blur e output anonimizzato con ledger dei job](docs/images/flusso-di-lavoro-anonimizzazione-visi.jpg)
 
 ### Session model (important)
 
@@ -153,7 +161,7 @@ commento `#` ignorato. Utile insieme ai test già pronti:
 ```powershell
 . .\scripts\load-env.ps1
 .\scripts\avvia-e-demo.ps1          # build + avvio + upload demo (ANON_MODE=blur|pixelate)
-.\scripts\test-wider.ps1 -Max 300   # test ACTIVE-mode su WIDER FACE
+.\scripts\test-wider.ps1 -MaxImages 300   # test ACTIVE-mode su WIDER FACE
 ```
 
 #### Aprire la porta del server sull'intranet (Windows Firewall)
@@ -216,8 +224,12 @@ A copy of the output is stored under `DATA_DIR`.
 Same multipart protocol, but accepts **multiple archive fields in one request**
 (any field named `file`, or whose name ends in .zip/.7z/.rar) — also works
 with **chunked transfer encoding** (no `Content-Length`). The body limit is
-disabled on this route: each archive is spooled to disk and processed **in
-sequence** under the single-job lock, so the total volume is unbounded.
+disabled on this route: each archive is spooled to disk (never buffered in
+RAM) and processed **in sequence** under the single-job lock, so the request
+volume is bounded by configuration rather than by a body limit:
+`MAX_ARCHIVES_PER_BATCH` (default 64) and `MAX_BATCH_TOTAL_BYTES` (default
+10 GiB) on top of the per-archive `MAX_ARCHIVE_BYTES`; exceeding any of them
+answers `413` and removes the archives already spooled.
 
 - With **one** archive the response is identical to `/anonymize`.
 - With **several**, the per-archive outputs are merged (streaming, entry by
@@ -323,10 +335,13 @@ The shipped compose file creates the service + 3 private buckets:
 ```bash
 docker compose -f docker-compose.minio.yml up -d --build
 ./scripts/s3_tools.sh upload frame.zip camera_001.zip   # -> s3://anonimizzazione-input/camera_001.zip
+# S3 ingest is gated by the operator key (S3_INGEST_AUTH_REQUIRED=true).
 curl -X POST localhost:8080/anonymize/s3 \
+     -H "X-Operator-Key: $OPERATOR_API_KEY" \
      -H 'Content-Type: application/json' \
      -d '{"input_key":"camera_001.zip"}'
-curl localhost:8080/status/<JOB_ID>                     # queued/running/done/failed
+curl -H "X-Operator-Key: $OPERATOR_API_KEY" \
+     localhost:8080/status/<JOB_ID>                     # queued/running/done/failed
 ```
 
 #### Bucket layout
@@ -362,6 +377,8 @@ Registered only when the backend is enabled:
 
 - `POST /anonymize/s3` — body
   `{"input_key":"...", "output_key":"...?", "callback_url":"...?"}`.
+  Requires the `X-Operator-Key` header while `S3_INGEST_AUTH_REQUIRED=true`
+  (default; `403` otherwise, and also when no `OPERATOR_API_KEY` is set).
   Enforces the webhook anti-SSRF allowlist (400 if the callback host is not
   listed), `404` if the input object does not exist, `202 Accepted` otherwise.
   The input object is **not** deleted (delete policy is only enabled on the
@@ -486,16 +503,19 @@ completamento tramite **webhook** o **polling** su `GET /status/:job_id`.
 
 ```python
 # Pseudocodice lato cliente
+import os
 import boto3, requests, time
 
 s3 = boto3.client("s3")
 base = "http://anonimizzazione.internal:8080"
+# S3 ingest richiede la chiave operatore (S3_INGEST_AUTH_REQUIRED=true, default)
+H = {"X-Operator-Key": os.environ["OPERATOR_API_KEY"]}
 
 # 1) Carica l'archivio nel bucket di input (streaming, mai in RAM)
 s3.upload_file("frames_2024.zip", "anonimizzazione-input", "cliente/frames_2024.zip")
 
 # 2) Sottoponi il job (input_key = chiave oggetto nel bucket di input)
-r = requests.post(f"{base}/anonymize/s3", json={
+r = requests.post(f"{base}/anonymize/s3", headers=H, json={
     "input_key": "cliente/frames_2024.zip",
     # "output_key": "elaborati/frames_2024_elaborato.zip",  # opzionale
     # "callback_url": "https://cliente.internal/hooks/anonimizzazione",  # opzionale (allowlist!)
@@ -509,7 +529,7 @@ job_id = r.json()["job_id"]
 
 # 3b) Oppure polling sullo stato:
 while True:
-    st = requests.get(f"{base}/status/{job_id}").json()
+    st = requests.get(f"{base}/status/{job_id}", headers=H).json()
     if st["state"] in ("done", "failed"):
         break
     time.sleep(5)
@@ -663,6 +683,39 @@ streaming): un singolo archive fino a `BODY_LIMIT_BYTES` va sempre bene; per
 volumi maggiori usate `/anonymize/batch` con più archive (o upload chunked),
 che non ha limiti di dimensione totale.
 
+#### Blur a somma scorrevole — A/B end-to-end (100 immagini WIDER val, ACTIVE + classificatore)
+
+Il box-blur della maschera (`pipeline.rs`, `box_blur_region`) è passato dalla
+rilettura dell'intera finestra ±radius per ogni pixel a una **finestra scorrevole**
+(l'accumulatore si aggiorna con un campione che entra e uno che esce). L'output è
+**byte-identico** — lo pinna `sliding_window_blur_is_byte_identical_to_reference` —
+cambia solo il costo.
+
+Misura end-to-end sulle **stesse** 100 immagini (`WIDER_val.zip`, stesse in ordine),
+`MASK_SEGMENTER=mediapipe`, `CLASSIFIER_ENFORCE=true`, ROI full-frame,
+`MAX_CONCURRENT_IMAGES=2`, 2 core fisici; confronto appaiato per immagine (la
+sequenza dei `detect=` conferma l'allineamento, a meno di scambi locali dovuti alla
+concorrenza 2):
+
+| Metrica | finestra scorrevole | per-pixel (prima) | Δ |
+|---|---|---|---|
+| `process_ms` medio | 3.210 ms | 3.311 ms | **+100 ms/immagine (+3,1%)** |
+| `process_ms` mediano | 2.577 ms | 2.621 ms | +55 ms |
+| somma `process_ms` (100 img) | 324,3 s | 334,4 s | +10,1 s |
+| durata dell'upload completo | 166,9 s | 172,0 s | +5,1 s (+3,1%) |
+| CPU del processo (server) | 313,8 s | 321,3 s | +7,5 s (≈75 ms/immagine) |
+
+- 71 immagini su 101 sono più lente con la vecchia implementazione: il segno è
+  coerente (test del segno), l'effetto non è rumore di macchina.
+- Il guadagno si concentra dove c'è più area da sfocare: da +42 ms/immagine con 0–3
+  volti a +92…+128 ms con 11–25 volti; sulle immagini molto affollate (26+ volti, 5 s
+  di `process_ms`) domina la varianza e il delta medio non è affidabile.
+- **Il microbenchmark isolato esagera**: sulla sola funzione, 20 volti 300×300 a
+  sigma 50 scendono da 76,1 s a 5,8 s (`blur_cost_sliding_window_vs_reference`,
+  `--ignored`, build debug). In pipeline la sfocatura è solo una frazione del
+  `process_ms` (il resto è detector + classificatore + segmenter MediaPipe), quindi
+  il guadagno end-to-end misurato è ~3%, non 13×.
+
 The provided default YOLO export outputs three `[1,80,H,W]` pose-head maps
 (DFL box + objectness + 5 keypoints); `run_yolo` decodes that format natively
 and falls back to classic `[1,C,anchors]` single-output models
@@ -686,6 +739,13 @@ cargo test real_face_model_smoke -- --ignored
 # end-to-end check against the real model + a photo:
 #   downloads public yolov8n-face.onnx + demo photo into .test-assets first
 ```
+
+Le suite usano directory di scratch uniche per run e ripulite al drop
+(`src/testutil.rs`) e chiudono **esplicitamente** il pool SQLite (`Db::close`). Senza
+quella chiusura `sqlx` libera il file `.sqlite3` solo all'uscita del processo e su
+Windows le directory restavano in `%TEMP%`: migliaia di residui, e quando il sistema
+riciclava un PID un run riapriva la directory di uno precedente vedendoci dentro uno
+schema già migrato — così test non correlati fallivano a caso.
 
 ## Offline detector evaluation (`eval-wider`, `eval-fddb`)
 
@@ -829,6 +889,47 @@ poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
   rendez-vous di sessioni su GPU vincolate l'arena con
   `ORT_CUDA_MEMORY_LIMIT_BYTES`.
 
+## Security hardening (review 2026-09, phases 0–1)
+
+Interventions applied after an internal security review. Phase 0 was
+behaviour-preserving for valid input; phase 1 adds the resource caps and the
+model/ingest policies below (see the table for the two knobs that *do* change
+defaults, both of them fail-closed and documented in `.env.example`).
+
+### Phase 0
+
+| Area | Behaviour now |
+| --- | --- |
+| Completion webhook (SSRF) | Redirects are never followed, only `http`/`https` are accepted, the allowlist matches the *scheme default port* (`host:443` ↔ `https://host/…`), and a host resolving to a private/link-local address (e.g. `169.254.169.254`, the cloud metadata service) is refused even when allowlisted. |
+| Queue `job_id` | The RabbitMQ `message_id` is producer-controlled and became a path component (`DATA_DIR/s3_<id>.in`): it is now validated (`[A-Za-z0-9._-]`, no `..`, ≤ 128 chars) and an unsafe value is logged escaped and pushed straight to the DLQ. The S3 worker re-validates at the sink, so every caller is covered. |
+| Operator key | Compared as SHA-256 digests in constant time (no length/prefix timing oracle), one generic 403 for both "not configured" and "wrong key" (no longer reveals whether a key exists), failures logged. |
+| Credentials in logs | The AMQP URL is redacted (`amqp://***@host:5672`); `OPERATOR_API_KEY` has a redacting `Debug`, so `{:?}` on `Config` can never print it. |
+| Error responses | Absolute filesystem paths are replaced with `<path>` in error bodies, `X-Processing-Errors-Detail` and `<input>_error.txt`; the full chain stays in the server log. |
+| Log injection | Upload-supplied names are rendered control-character-free in log lines, so a CR/LF in a file name can no longer forge entries. |
+| Config | `NaN`/`inf` are rejected for every float knob instead of silently poisoning thresholds, blur sigma and ratio checks. |
+| Request handling | Every response carries `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and a CSP tuned for the operator settings page. The upload deadline (`REQUEST_TIMEOUT_SECS`, default 3600 s, 0 = off) is enforced on the **body transfer only** — multipart header read and archive chunks, one shared budget per request — and answers `408`; processing time is deliberately not counted, so a job that takes hours still completes. It matters because the global single-job lock is taken **before** the body is spooled: without it one slow client blocks every other client. |
+| Temp files | Spooled uploads and `.7z`/`.rar` extraction scratch are removed by RAII guards, so an early error, a client disconnect or a panic cannot leak them. |
+| Deployment | The compose files no longer ship a default `OPERATOR_API_KEY`: `docker compose up` fails fast until a real key is set. |
+
+### Phase 1 — resource caps and ingest/model policy
+
+| Area | Behaviour now |
+| --- | --- |
+| Archive decompression (zip-bomb) | `MAX_ENTRIES_PER_ARCHIVE` (100k), `MAX_ENTRY_BYTES` (200 MiB), `MAX_TOTAL_UNCOMPRESSED_BYTES` (8 GiB per archive) and `MAX_COMPRESSION_RATIO` (500x, spike detector) are enforced **while reading**, before allocating: a *declared* size is rejected up front, and a header that lies is stopped at `cap + 1` bytes. A cap violation aborts the whole job (400/413) because such an archive is hostile; a merely corrupt entry is still skipped and reported per-entry. `0` disables an individual check. |
+| Image decode | `MAX_IMAGE_WIDTH` / `MAX_IMAGE_HEIGHT` / `MAX_IMAGE_ALLOC_BYTES` are handed to the image decoder, so a 20000x20000 frame cannot allocate ~1.5 GiB per detection crop. |
+| Upload/batch volume | `MAX_ARCHIVE_BYTES` (3.5 GiB) bounds one upload on `/anonymize`; `/anonymize/batch` (no body limit by design — archives are spooled to disk) is bounded by `MAX_ARCHIVES_PER_BATCH` (64) and `MAX_BATCH_TOTAL_BYTES` (10 GiB) and answers `413` when either is exceeded. Outputs already produced by an aborted batch are deleted immediately, and every spooled archive is removed by its RAII guard. The same `MAX_ARCHIVE_BYTES` also bounds an S3 object download (checked against `Content-Length` first, then per chunk), so a bucket object cannot fill the scratch disk either. |
+| Model downloads | `https://` is required for non-loopback hosts (`http://127.0.0.1`/`localhost`/`::1` stays allowed for a local model server; `MODEL_ALLOW_HTTP=true` overrides), embedded credentials are refused, redirects are bounded by `MODEL_MAX_REDIRECTS` (2) and a 3xx that is not followed is an error instead of a bodyless "model", and `MODEL_SHA_REQUIRED=true` refuses to start a model with no matching `MODEL_*_SHA256`. |
+| S3 ingest | `S3_INGEST_AUTH_REQUIRED=true` (new default) gates `/anonymize/s3` and `/status/:job_id` with the same constant-time operator key — without it, anyone reaching the port could process/overwrite/delete arbitrary bucket keys and read others' job status. Fail-closed: enabled with no `OPERATOR_API_KEY` configured means every S3 ingest request answers 403. |
+| Queue-driven deletes | `delete_input_on_success` in an SQS/RabbitMQ message is **ignored** unless `S3_TRUST_MESSAGE_DELETE=true`, with a warning per ignored attempt: a forged message can no longer delete bucket objects. `/operator/s3/sweep` (authenticated) still honours the flag from its own body. |
+
+**Still open** (phase 2, listed on purpose so it is not forgotten):
+
+- No TLS in-process, no rate limiting, no audit trail of operator calls;
+  `BIND_ADDR` defaults to `0.0.0.0`. Terminate HTTPS at a reverse proxy and keep
+  the port off untrusted networks (see the firewall note above).
+- The weak "contains `onnx`" fallback integrity check still exists for models
+  configured without a SHA: set `MODEL_SHA_REQUIRED=true` in production.
+
 ## Spec open points — status
 
 1. **Seed dataset** — external (mounted at `dataset_seed/real_faces`); the
@@ -838,7 +939,9 @@ poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
 2. **Keypoints** — resolved: the default public model exports 5 landmarks;
    ACTIVE uses hull blur, with ellipse fallback decided at runtime from the
    model's actual output.
-3. **Operator auth** — API key via `X-Operator-Key` header.
+3. **Operator auth** — API key via `X-Operator-Key`, compared in constant time
+   with a single generic 403 and logged failures; rate limiting and an audit
+   trail of operator calls are still open (see "Security hardening" above).
 4. **Formats** — JPEG/PNG only; everything else is a counted, logged skip.
 5. **Concurrent uploads** — global job lock, `HTTP 429 Too Many Requests`.
 6. **S3 storage backend** — implemented behind the `s3` cargo feature
@@ -858,4 +961,8 @@ poison the classifier seed); `--include-ignored` re-enables `ignore==1` faces,
 
 This crate lives in the `src/` subfolder of the repository; the repository-root
 `Cargo.toml` declares the workspace (build from the repo root or from inside
-`src/` — the Docker build is self-contained and works either way).
+`src/` — the Docker build is self-contained and works either way). Because the
+workspace owns the build directory, cargo puts the artifacts in the **workspace**
+`target/` (`<repo>/target/{debug,release}/`), *not* in `src/target/`: the
+`eval-*` examples above are relative to the repository root, and the shipped
+PowerShell scripts resolve the real binary path via `cargo metadata`.

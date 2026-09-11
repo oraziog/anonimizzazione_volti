@@ -16,7 +16,9 @@ services:
       # Auto-detected when unset (cores ≤ 4 → cores; cores > 4 → cores − 2)
       MAX_CONCURRENT_IMAGES: "8"
       CRON_RETRAIN_SCHEDULE: "03:00"    # HH:MM local
-      OPERATOR_API_KEY: "${OPERATOR_API_KEY:-change-me-operator-key}"
+      # No default on purpose: a known key would expose every operator route.
+      # `docker compose up` now fails fast until you set a real one in .env.
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:?OPERATOR_API_KEY is required - set a strong key in .env (see .env.example)}"
       # STORE-output retention (see .env.example for every RETENTION_* knob)
       RETENTION_ENABLED: "${RETENTION_ENABLED:-true}"
       RETENTION_MAX_DAYS: "${RETENTION_MAX_DAYS:-30}"

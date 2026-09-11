@@ -186,6 +186,22 @@ impl S3ZipWorker {
     )]
     pub async fn run_queue_job(&self, msg: &QueueJobMessage, job_id: &str) -> Result<()> {
         let output_key = validate_queue_message(msg)?;
+        // A queue message is data from (potentially) an untrusted producer:
+        // its `delete_input_on_success` is honoured only when the operator
+        // opted in (`S3_TRUST_MESSAGE_DELETE=true`). Otherwise the flag is
+        // ignored and the request logged, so a forged message cannot delete
+        // bucket objects.
+        let delete_input = should_delete_message_input(
+            self.settings.trust_message_delete,
+            msg.delete_input_on_success,
+        );
+        if msg.delete_input_on_success && !delete_input {
+            tracing::warn!(
+                "queue message for '{}' requested delete_input_on_success but \
+                 S3_TRUST_MESSAGE_DELETE=false — ignoring (input kept)",
+                crate::log_safe(&msg.input_key)
+            );
+        }
         self.tracker
             .submit(job_id.to_string(), msg.input_key.clone(), output_key.clone())
             .await;
@@ -195,7 +211,7 @@ impl S3ZipWorker {
             &output_key,
             msg.callback_url.as_deref(),
             S3JobPolicy {
-                delete_input_on_success: msg.delete_input_on_success,
+                delete_input_on_success: delete_input,
             },
         )
         .await
@@ -224,6 +240,12 @@ impl S3ZipWorker {
         callback_url: Option<&str>,
         policy: S3JobPolicy,
     ) -> Result<()> {
+        // Sink-side guard (defense in depth): every caller's id — HTTP UUID,
+        // SQS broker id, RabbitMQ `message_id` — must be safe before it becomes
+        // a path component.
+        let job_id = safe_job_id(job_id)
+            .ok_or_else(|| anyhow::anyhow!("unsafe job_id rejected (allowed: [A-Za-z0-9._-], no '..', max 128)"))?;
+
         // Job-level concurrency cap: several queued jobs may wait here; the
         // per-image semaphore inside `processor` still bounds actual compute.
         let permit = self
@@ -243,6 +265,10 @@ impl S3ZipWorker {
 
         let scratch = self.processor.data_dir();
         let temp_in = scratch.join(format!("s3_{}.in", job_id));
+        // Guard: the download → anonymize → upload chain can bail anywhere and
+        // a cancelled task drops the future outright, so the spooled input must
+        // never depend on reaching the cleanup at the end of this function.
+        let _temp_guard = crate::zip_worker::CleanupPath::file(temp_in.clone());
         let outcome = self.process_one(job_id, input_key, output_key, &temp_in).await;
 
         let job_result = match outcome {
@@ -310,9 +336,6 @@ impl S3ZipWorker {
             }
         };
 
-        // Scratch input + the processed local output ZIP are temporary by
-        // design (already uploaded); never leave them behind for retention.
-        let _ = tokio::fs::remove_file(&temp_in).await;
         drop(permit);
         job_result
     }
@@ -329,7 +352,14 @@ impl S3ZipWorker {
         tracing::info!("S3 job {job_id}: downloading s3://{}/{}", self.s3.bucket_input, input_key);
         let downloaded = self
             .s3
-            .download_streaming(&self.s3.bucket_input, input_key, temp_in)
+            .download_streaming(
+                &self.s3.bucket_input,
+                input_key,
+                temp_in,
+                // Same cap as an HTTP upload: an oversized object must not
+                // fill the scratch disk (0 = unlimited).
+                self.processor.max_archive_bytes(),
+            )
             .await
             .context("download input archive from S3")?;
 
@@ -464,6 +494,23 @@ impl S3ZipWorker {
             );
             return;
         }
+        // Defense in depth on top of the allowlist: even an allowlisted name
+        // must not resolve to a private/link-local address. A typo'd (or
+        // internally-pointing) allowlist entry would otherwise reach the cloud
+        // metadata service (169.254.169.254) or a LAN admin panel.
+        let target = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| (h.to_string(), u.port_or_known_default().unwrap_or(80))));
+        let Some((host, port)) = target else {
+            tracing::warn!("S3 job {job_id}: webhook URL not parseable, skipped");
+            return;
+        };
+        if !host_is_public(&host, port).await {
+            tracing::warn!(
+                "S3 job {job_id}: webhook host {host} resolves to a private/link-local address, skipped"
+            );
+            return;
+        }
         let download_url = match self
             .s3
             .generate_presigned_url(&self.s3.bucket_output, output_key, 3600)
@@ -486,21 +533,30 @@ impl S3ZipWorker {
             "output_size": outcome.output_size,
             "download_url": download_url,
         });
-        if let Err(e) = reqwest::Client::new()
-            .post(url)
-            .json(&payload)
+        // Redirects are NOT followed: the allowlist and the private-IP check
+        // are evaluated on the URL we were given, so a 302 from an allowlisted
+        // host to http://169.254.169.254/… would bypass both.
+        let client = match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
+            .build()
         {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("S3 job {job_id}: cannot build webhook client: {e}");
+                return;
+            }
+        };
+        if let Err(e) = client.post(url).json(&payload).send().await {
             tracing::warn!("S3 job {job_id}: webhook POST to {url} failed: {e}");
         }
     }
 }
 
 /// Allowlist check for the completion webhook URL: the `host[:port]` of the
-/// parsed URL must be one of `S3_WEBHOOK_ALLOWED_HOSTS`. The port-only match
-/// is exact; a bare host entry matches any port of that host.
+/// parsed URL must be one of `S3_WEBHOOK_ALLOWED_HOSTS`. The port match is
+/// exact; a bare host entry matches any port of that host. Only `http`/`https`
+/// are accepted.
 pub fn webhook_host_allowed(settings: &S3Settings, url_str: &str) -> bool {
     if settings.webhook_allowed_hosts.is_empty() {
         return false;
@@ -508,17 +564,96 @@ pub fn webhook_host_allowed(settings: &S3Settings, url_str: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url_str) else {
         return false;
     };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
     let Some(host) = url.host_str() else {
         return false;
     };
     let host = host.to_ascii_lowercase();
+    // `port_or_known_default` resolves the implicit :80/:443. Using `port()`
+    // (always `None` for the scheme default) made an entry like `host:443`
+    // never match an `https://host/…` URL: the allowlist silently degraded.
+    let port = url.port_or_known_default().unwrap_or(80).to_string();
     settings.webhook_allowed_hosts.iter().any(|allowed| {
         if let Some((h, p)) = allowed.rsplit_once(':') {
-            h == host && p == url.port().map(|p| p.to_string()).as_deref().unwrap_or("80")
+            h == host && p == port
         } else {
             allowed == &host
         }
     })
+}
+
+/// True when every address `host` resolves to is globally routable. Blocks the
+/// classic SSRF targets: loopback, RFC1918, link-local `169.254/16` (the cloud
+/// metadata endpoint), CGNAT `100.64/10`, multicast/unspecified and the IPv6
+/// equivalents (ULA `fc00::/7`, link-local `fe80::/10`). An unresolvable host is
+/// treated as NOT public (fail-closed).
+async fn host_is_public(host: &str, port: u16) -> bool {
+    use std::net::IpAddr;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_public_ip(ip);
+    }
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => {
+            let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+            !ips.is_empty() && ips.iter().all(|ip| is_public_ip(*ip))
+        }
+        Err(e) => {
+            tracing::warn!("webhook host {host} cannot be resolved: {e}");
+            false
+        }
+    }
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                // CGNAT 100.64.0.0/10
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                // 192.0.0.0/24 (IETF protocol assignments)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // 240.0.0.0/4 reserved
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // unique local
+                || (s[0] & 0xffc0) == 0xfe80 // unicast link-local
+                || v6.to_ipv4_mapped().is_some_and(|v4| !is_public_ip(IpAddr::V4(v4))))
+        }
+    }
+}
+
+/// A `job_id` is used verbatim in a filesystem path (`DATA_DIR/s3_<id>.in`) and
+/// in the audit object key, and for queue intake it is producer-controlled
+/// (RabbitMQ `message_id`) — so a value like `../../etc/x` must be rejected.
+/// Only a conservative charset is accepted (no separators, no `..`, no control
+/// characters), so the id is also safe to interpolate into log lines.
+pub fn safe_job_id(id: &str) -> Option<&str> {
+    if id.is_empty() || id.len() > 128 || id.contains("..") {
+        return None;
+    }
+    if id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 /// Message schema accepted by the async queue consumers (SQS feature `queue`,
@@ -542,6 +677,13 @@ pub struct QueueJobMessage {
     /// Delete the input object after success (sweep-style consumers).
     #[serde(default)]
     pub delete_input_on_success: bool,
+}
+
+/// Whether the `delete_input_on_success` flag *carried by a queue message*
+/// may be honoured. A message is attacker-controllable data, so the flag only
+/// takes effect when the operator opted in with `S3_TRUST_MESSAGE_DELETE=true`.
+pub(crate) fn should_delete_message_input(trust_message_delete: bool, requested: bool) -> bool {
+    requested && trust_message_delete
 }
 
 /// Validates the input/output keys of a queue message the same way the HTTP
@@ -681,7 +823,19 @@ mod tests {
             bucket_logs: "logs".into(),
             max_concurrent_jobs: 2,
             webhook_allowed_hosts: hosts,
+            trust_message_delete: false,
         }
+    }
+
+    #[test]
+    fn queue_message_delete_flag_is_not_trusted_by_default() {
+        // Default posture: a forged/compromised producer cannot delete bucket
+        // objects by setting `delete_input_on_success`.
+        assert!(!should_delete_message_input(false, false));
+        assert!(!should_delete_message_input(false, true));
+        // Explicit operator opt-in (S3_TRUST_MESSAGE_DELETE=true).
+        assert!(should_delete_message_input(true, true));
+        assert!(!should_delete_message_input(true, false));
     }
 
     #[test]
@@ -722,6 +876,79 @@ mod tests {
             &s,
             "http://NOTIFICHE.INTERNAL:80/x"
         ));
+    }
+
+    /// An entry written as `host:443` must match an `https://host/…` URL: the
+    /// old code compared against `port()` (always `None` for the scheme
+    /// default, coerced to "80") so the allowlist silently never matched.
+    #[test]
+    fn webhook_allowlist_uses_the_scheme_default_port() {
+        let s = settings_with_webhooks(vec!["hook.it:443".into()]);
+        assert!(webhook_host_allowed(&s, "https://hook.it/end"));
+        assert!(!webhook_host_allowed(&s, "https://hook.it:8443/end"));
+
+        let s = settings_with_webhooks(vec!["hook.it:80".into()]);
+        assert!(webhook_host_allowed(&s, "http://hook.it/end"));
+        assert!(!webhook_host_allowed(&s, "https://hook.it/end"));
+    }
+
+    #[test]
+    fn webhook_allowlist_rejects_non_http_schemes() {
+        let s = settings_with_webhooks(vec!["hook.it".into()]);
+        assert!(webhook_host_allowed(&s, "http://hook.it/x"));
+        assert!(!webhook_host_allowed(&s, "file://hook.it/etc/passwd"));
+        assert!(!webhook_host_allowed(&s, "gopher://hook.it/x"));
+    }
+
+    /// The webhook must never be able to reach loopback / RFC1918 / link-local
+    /// (cloud metadata) addresses, even when the allowlist names them.
+    #[test]
+    fn private_and_link_local_addresses_are_not_public() {
+        use std::net::IpAddr;
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.9.9",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "192.0.0.1",
+            "240.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_public_ip(ip), "{ip} must not be considered public");
+        }
+        for ip in ["1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_public_ip(ip), "{ip} must be public");
+        }
+    }
+
+    #[test]
+    fn job_ids_must_be_path_safe() {
+        assert_eq!(safe_job_id("9f8c-1a_2.3"), Some("9f8c-1a_2.3"));
+        for bad in [
+            "../../etc/passwd",
+            "s3_..",
+            "..",
+            "a/b",
+            "a\\b",
+            "C:\\tmp\\x",
+            "job\nid",
+            "job\rid",
+            "",
+            " ",
+            "a..b",
+        ] {
+            assert!(safe_job_id(bad).is_none(), "{bad:?} must be rejected");
+        }
+        let too_long = "x".repeat(129);
+        assert!(safe_job_id(&too_long).is_none());
     }
 
     #[test]

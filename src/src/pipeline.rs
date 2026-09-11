@@ -64,12 +64,12 @@ impl AnonOp {
         }
     }
 
-    /// Applies the operation only where `mask` is set (ACTIVE), softening the
-    /// mask edge with `mask_sigma` first.
-    fn apply_masked(&self, img: &mut image::RgbaImage, mask: &image::GrayImage, mask_sigma: f32) {
+    /// Applies the operation only where the region's mask is set (ACTIVE),
+    /// softening the mask edge with `mask_sigma` first.
+    fn apply_masked(&self, img: &mut image::RgbaImage, region: &MaskRegion, mask_sigma: f32) {
         match *self {
-            AnonOp::Blur(s) => apply_masked_blur(img, mask, s, mask_sigma),
-            AnonOp::Pixelate(c) => apply_masked_pixelate(img, mask, mask_sigma, c),
+            AnonOp::Blur(s) => apply_masked_blur(img, region, s, mask_sigma),
+            AnonOp::Pixelate(c) => apply_masked_pixelate(img, region, mask_sigma, c),
         }
     }
 
@@ -130,54 +130,90 @@ fn box_blur_region(img: &mut image::RgbaImage, region: Rect, radius: i64) {
     }
 
     // Horizontal pass into a temp buffer, then vertical pass back into img.
+    //
+    // Both passes slide the window instead of re-reading the whole ±radius
+    // neighbourhood per pixel: the accumulator is seeded once and then updated
+    // by one entering/leaving sample per step, so a pixel costs O(1) instead of
+    // O(2·radius+1) (up to 151 samples at sigma 50) — same window, same integer
+    // average, byte-identical output.
     let rw = (x1 - x0 + 1) as usize;
     let rh = (y1 - y0 + 1) as usize;
     let mut tmp = vec![[0u32; 4]; rw * rh];
 
     for y in y0..=y1 {
-        for x in x0..=x1 {
-            let mut acc = [0u32; 4];
-            let mut count = 0u32;
-            for dx in (x - radius)..=(x + radius) {
-                if dx < 0 || dx >= w {
-                    continue;
-                }
-                let p = img.get_pixel(dx as u32, y as u32);
-                acc[0] += p.0[0] as u32;
-                acc[1] += p.0[1] as u32;
-                acc[2] += p.0[2] as u32;
-                acc[3] += p.0[3] as u32;
-                count += 1;
+        // Window for x = x0: [x0-radius, x0+radius] ∩ [0, w-1].
+        let mut acc = [0u32; 4];
+        let mut count = 0u32;
+        for dx in (x0 - radius).max(0)..=(x0 + radius).min(w - 1) {
+            let p = img.get_pixel(dx as u32, y as u32);
+            for (a, v) in acc.iter_mut().zip(p.0) {
+                *a += v as u32;
             }
-            let idx = ((y - y0) as usize) * rw + (x - x0) as usize;
-            tmp[idx] = [
+            count += 1;
+        }
+        let row = ((y - y0) as usize) * rw;
+        for x in x0..=x1 {
+            tmp[row + (x - x0) as usize] = [
                 acc[0] / count,
                 acc[1] / count,
                 acc[2] / count,
                 acc[3] / count,
             ];
-        }
-    }
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let mut acc = [0u32; 4];
-            let mut count = 0u32;
-            for dy in (y - radius)..=(y + radius) {
-                if dy < y0 || dy > y1 {
-                    continue;
+            // Slide to x+1: the column right of the window enters, the leftmost
+            // one leaves (it is always part of the current sum, so no wrap).
+            let enter = x + radius + 1;
+            if enter < w {
+                let p = img.get_pixel(enter as u32, y as u32);
+                for (a, v) in acc.iter_mut().zip(p.0) {
+                    *a += v as u32;
                 }
-                let idx = ((dy - y0) as usize) * rw + (x - x0) as usize;
-                acc[0] += tmp[idx][0];
-                acc[1] += tmp[idx][1];
-                acc[2] += tmp[idx][2];
-                acc[3] += tmp[idx][3];
                 count += 1;
             }
+            let leave = x - radius;
+            if leave >= 0 {
+                let p = img.get_pixel(leave as u32, y as u32);
+                for (a, v) in acc.iter_mut().zip(p.0) {
+                    *a -= v as u32;
+                }
+                count -= 1;
+            }
+        }
+    }
+
+    // Vertical pass, same sliding window down each column; the window is
+    // clamped to the region rows ([y0, y1]) as before.
+    for x in x0..=x1 {
+        let mut acc = [0u32; 4];
+        let mut count = 0u32;
+        for dy in y0..=(y0 + radius).min(y1) {
+            let p = tmp[(dy - y0) as usize * rw + (x - x0) as usize];
+            for (a, v) in acc.iter_mut().zip(p) {
+                *a += v;
+            }
+            count += 1;
+        }
+        for y in y0..=y1 {
             let p = img.get_pixel_mut(x as u32, y as u32);
             p.0[0] = (acc[0] / count) as u8;
             p.0[1] = (acc[1] / count) as u8;
             p.0[2] = (acc[2] / count) as u8;
             p.0[3] = (acc[3] / count) as u8;
+            let enter = y + radius + 1;
+            if enter <= y1 {
+                let p = tmp[(enter - y0) as usize * rw + (x - x0) as usize];
+                for (a, v) in acc.iter_mut().zip(p) {
+                    *a += v;
+                }
+                count += 1;
+            }
+            let leave = y - radius;
+            if leave >= y0 {
+                let p = tmp[(leave - y0) as usize * rw + (x - x0) as usize];
+                for (a, v) in acc.iter_mut().zip(p) {
+                    *a -= v;
+                }
+                count -= 1;
+            }
         }
     }
 }
@@ -200,30 +236,76 @@ fn mask_bbox(mask: &image::GrayImage) -> (u32, u32, u32, u32) {
     (min.0, min.1, max.0 - min.0, max.1 - min.1)
 }
 
-/// Applies an operation only where the mask is set (mask: 255 = op, 0 = keep).
+/// A mask cropped to its non-zero bounding box plus its top-left corner in
+/// frame coordinates. ACTIVE per-face work then stays O(face): the `mask_from_*`
+/// constructors allocate a face-sized buffer instead of a full-frame one and
+/// no full-frame scan is needed to locate the mask before blurring
+/// (previously one `w×h` `GrayImage` + one full-frame `mask_bbox` scan were
+/// spent per face on a busy frame).
+struct MaskRegion {
+    mask: image::GrayImage,
+    origin: (u32, u32),
+}
+
+impl MaskRegion {
+    /// Frame-coordinate mask sample — 0 outside the trimmed region.
+    #[cfg(test)]
+    fn frame_pixel(&self, x: u32, y: u32) -> image::Luma<u8> {
+        let (ox, oy) = self.origin;
+        if x < ox || y < oy {
+            return image::Luma([0u8]);
+        }
+        let (dx, dy) = (x - ox, y - oy);
+        let (w, h) = self.mask.dimensions();
+        if dx >= w || dy >= h {
+            return image::Luma([0u8]);
+        }
+        *self.mask.get_pixel(dx, dy)
+    }
+}
+
+/// Trims a bbox-local mask to its non-zero bounding box, translating the frame
+/// origin accordingly. An all-zero mask becomes empty (0×0) so `apply_masked`
+/// short-circuits.
+fn mask_trim(mask: image::GrayImage, origin: (u32, u32)) -> MaskRegion {
+    let (bx, by, bw, bh) = mask_bbox(&mask);
+    if bw == 0 || bh == 0 {
+        return MaskRegion {
+            mask: image::GrayImage::new(0, 0),
+            origin,
+        };
+    }
+    let cropped = image::imageops::crop_imm(&mask, bx, by, bw, bh).to_image();
+    MaskRegion {
+        mask: cropped,
+        origin: (origin.0 + bx, origin.1 + by),
+    }
+}
+
+/// Applies an operation only where the region's mask is set (255 = op, 0 = keep).
 /// The mask is blurred slightly first to avoid hard aliasing at edges.
 ///
 /// Feather, blur and compositing all run on the mask's **bounding box** only —
 /// per-face cost is O(mask bbox) instead of O(full frame), which matters when
-/// an ACTIVE frame holds many faces (one full-frame copy was made per face).
+/// an ACTIVE frame holds many faces. `region` is already bbox-local (see
+/// [`MaskRegion`]/`mask_trim`), so no full-frame scan is needed to find it.
 /// `op` receives the scratch copy plus its origin `(ox, oy)` in frame
 /// coordinates (used by the mosaic to keep blocks aligned to the frame grid).
 fn apply_masked(
     img: &mut image::RgbaImage,
-    mask: &image::GrayImage,
+    region: &MaskRegion,
     feather_sigma: f32,
     op: impl Fn(&mut image::RgbaImage, i64, i64),
 ) {
-    let (w, h) = img.dimensions();
-    debug_assert_eq!((w, h), mask.dimensions());
-    let (ox, oy, bw, bh) = mask_bbox(mask);
+    let (ox, oy) = region.origin;
+    let (bw, bh) = region.mask.dimensions();
     if bw == 0 || bh == 0 {
         return;
     }
     let soft: image::GrayImage = {
         let f32_mask: image::ImageBuffer<image::Luma<f32>, Vec<f32>> =
             image::ImageBuffer::from_fn(bw, bh, |x, y| {
-                image::Luma([mask.get_pixel(ox + x, oy + y).0[0] as f32])
+                image::Luma([region.mask.get_pixel(x, y).0[0] as f32])
             });
         let blurred = imageproc::filter::gaussian_blur_f32(&f32_mask, feather_sigma);
         image::GrayImage::from_fn(bw, bh, |x, y| {
@@ -257,11 +339,11 @@ fn apply_masked(
 /// silhouette stays crisp instead of a wide translucent band).
 fn apply_masked_blur(
     img: &mut image::RgbaImage,
-    mask: &image::GrayImage,
+    region: &MaskRegion,
     sigma: f32,
     feather_sigma: f32,
 ) {
-    apply_masked(img, mask, feather_sigma, |scratch, _ox, _oy| {
+    apply_masked(img, region, feather_sigma, |scratch, _ox, _oy| {
         let (w, h) = scratch.dimensions();
         let full = Rect {
             x0: 0.0,
@@ -276,11 +358,11 @@ fn apply_masked_blur(
 /// Mosaic/pixelate (Google Street View style) only where the mask is set.
 fn apply_masked_pixelate(
     img: &mut image::RgbaImage,
-    mask: &image::GrayImage,
+    region: &MaskRegion,
     feather_sigma: f32,
     cell: u32,
 ) {
-    apply_masked(img, mask, feather_sigma, |scratch, ox, oy| {
+    apply_masked(img, region, feather_sigma, |scratch, ox, oy| {
         // Operator runs on the mask's bbox crop; the region start(-ox)+local
         // is a uniform sub-cell shift of the frame-anchored grid (the mosaic
         // stays block-uniform; the shift is capped at `cell-1` px).
@@ -366,13 +448,16 @@ fn cross2(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
     (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)
 }
 
-/// Builds a mask from a convex polygon ring (hull of keypoints, spec §4
-/// ACTIVE). Self-contained convex fill (half-plane test per pixel); the ring
-/// is expanded about its centroid by `margin_pct` first.
-fn mask_from_polygon(w: u32, h: u32, polygon: &[(f32, f32)], margin_pct: f32) -> image::GrayImage {
-    let mut mask = image::GrayImage::from_pixel(w, h, image::Luma([0u8]));
+/// Builds a bbox-local mask from a convex polygon ring (hull of keypoints, spec
+/// §4 ACTIVE). Self-contained convex fill (half-plane test per pixel); the ring
+/// is expanded about its centroid by `margin_pct` first. Only the ring's
+/// bounding box is allocated and filled — no full-frame buffer or scan.
+fn mask_from_polygon(w: u32, h: u32, polygon: &[(f32, f32)], margin_pct: f32) -> MaskRegion {
     if polygon.len() < 3 {
-        return mask;
+        return MaskRegion {
+            mask: image::GrayImage::new(0, 0),
+            origin: (0, 0),
+        };
     }
     let n = polygon.len();
     let cx: f32 = polygon.iter().map(|p| p.0).sum::<f32>() / n as f32;
@@ -395,7 +480,10 @@ fn mask_from_polygon(w: u32, h: u32, polygon: &[(f32, f32)], margin_pct: f32) ->
     }
     let orient = if area2 > 0.0 { 1.0 } else { -1.0 };
     if area2 == 0.0 {
-        return mask;
+        return MaskRegion {
+            mask: image::GrayImage::new(0, 0),
+            origin: (0, 0),
+        };
     }
 
     let x0 = ring
@@ -418,7 +506,14 @@ fn mask_from_polygon(w: u32, h: u32, polygon: &[(f32, f32)], margin_pct: f32) ->
         .map(|p| p.1.ceil())
         .fold(f32::MIN, f32::max)
         .min(h as f32) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return MaskRegion {
+            mask: image::GrayImage::new(0, 0),
+            origin: (0, 0),
+        };
+    }
 
+    let mut mask = image::GrayImage::from_pixel(x1 - x0, y1 - y0, image::Luma([0u8]));
     for y in y0..y1 {
         for x in x0..x1 {
             let p = (x as f32 + 0.5, y as f32 + 0.5);
@@ -431,35 +526,44 @@ fn mask_from_polygon(w: u32, h: u32, polygon: &[(f32, f32)], margin_pct: f32) ->
                 }
             }
             if inside {
-                mask.put_pixel(x, y, image::Luma([255u8]));
+                mask.put_pixel(x - x0, y - y0, image::Luma([255u8]));
             }
         }
     }
-    mask
+    mask_trim(mask, (x0, y0))
 }
 
-/// Builds a mask from an axis-aligned rect (used by tests / full cover).
+/// Builds a bbox-local mask from an axis-aligned rect (used by tests / full
+/// cover).
 #[allow(dead_code)]
-fn mask_from_rect(w: u32, h: u32, r: Rect) -> image::GrayImage {
-    let mut mask = image::GrayImage::from_pixel(w, h, image::Luma([0u8]));
+fn mask_from_rect(w: u32, h: u32, r: Rect) -> MaskRegion {
     let x0 = r.x0.round().max(0.0) as i64;
     let y0 = r.y0.round().max(0.0) as i64;
     let x1 = (r.x1.round() as i64).min(w as i64 - 1);
     let y1 = (r.y1.round() as i64).min(h as i64 - 1);
-    if x1 > x0 && y1 > y0 {
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                mask.put_pixel(x as u32, y as u32, image::Luma([255u8]));
-            }
+    if !(x1 > x0 && y1 > y0) {
+        return MaskRegion {
+            mask: image::GrayImage::new(0, 0),
+            origin: (0, 0),
+        };
+    }
+    let mut mask = image::GrayImage::from_pixel(
+        (x1 - x0 + 1) as u32,
+        (y1 - y0 + 1) as u32,
+        image::Luma([0u8]),
+    );
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            mask.put_pixel((x - x0) as u32, (y - y0) as u32, image::Luma([255u8]));
         }
     }
-    mask
+    mask_trim(mask, (x0 as u32, y0 as u32))
 }
 
-/// Builds a mask from an ellipse inscribed in the bounding box (spec §4
-/// fallback when keypoints are unavailable).
-fn mask_from_ellipse(w: u32, h: u32, r: Rect, margin_pct: f32) -> image::GrayImage {
-    let mut mask = image::GrayImage::from_pixel(w, h, image::Luma([0u8]));
+/// Frame-coordinate extent of an ellipse inscribed in `r` with `margin_pct`
+/// added to both radii, clamped to the frame (inclusive range, or `None` when
+/// a degenerate box leaves nothing to fill).
+fn ellipse_extent(w: u32, h: u32, r: Rect, margin_pct: f32) -> Option<(u32, u32, u32, u32)> {
     let cx = (r.x0 + r.x1) / 2.0;
     let cy = (r.y0 + r.y1) / 2.0;
     let rx = ((r.x1 - r.x0) / 2.0 * (1.0 + margin_pct)).max(1.0);
@@ -468,16 +572,51 @@ fn mask_from_ellipse(w: u32, h: u32, r: Rect, margin_pct: f32) -> image::GrayIma
     let x1 = (cx + rx).ceil().min(w as f32 - 1.0) as u32;
     let y0 = (cy - ry).floor().max(0.0) as u32;
     let y1 = (cy + ry).ceil().min(h as f32 - 1.0) as u32;
+    if x1 < x0 || y1 < y0 {
+        None
+    } else {
+        Some((x0, x1, y0, y1))
+    }
+}
+
+/// Untrimmed bbox-local ellipse mask (extent-sized) plus its frame origin.
+/// Note the local buffer can be a few rows/columns larger than the ellipse's
+/// actual non-zero bbox (extreme rows/columns only touch the ellipse edge or
+/// miss it entirely) — `mask_trim` tightens it at the call sites.
+fn ellipse_local(
+    w: u32,
+    h: u32,
+    r: Rect,
+    margin_pct: f32,
+) -> Option<(image::GrayImage, (u32, u32))> {
+    let (x0, x1, y0, y1) = ellipse_extent(w, h, r, margin_pct)?;
+    let cx = (r.x0 + r.x1) / 2.0;
+    let cy = (r.y0 + r.y1) / 2.0;
+    let rx = ((r.x1 - r.x0) / 2.0 * (1.0 + margin_pct)).max(1.0);
+    let ry = ((r.y1 - r.y0) / 2.0 * (1.0 + margin_pct)).max(1.0);
+    let mut mask = image::GrayImage::from_pixel(x1 - x0 + 1, y1 - y0 + 1, image::Luma([0u8]));
     for y in y0..=y1 {
         for x in x0..=x1 {
             let dx = (x as f32 - cx) / rx;
             let dy = (y as f32 - cy) / ry;
             if dx * dx + dy * dy <= 1.0 {
-                mask.put_pixel(x, y, image::Luma([255u8]));
+                mask.put_pixel(x - x0, y - y0, image::Luma([255u8]));
             }
         }
     }
-    mask
+    Some((mask, (x0, y0)))
+}
+
+/// Builds a mask from an ellipse inscribed in the bounding box (spec §4
+/// fallback when keypoints are unavailable).
+fn mask_from_ellipse(w: u32, h: u32, r: Rect, margin_pct: f32) -> MaskRegion {
+    match ellipse_local(w, h, r, margin_pct) {
+        Some((mask, origin)) => mask_trim(mask, origin),
+        None => MaskRegion {
+            mask: image::GrayImage::new(0, 0),
+            origin: (0, 0),
+        },
+    }
 }
 
 /// Top-left origin of the [`crop_clamped`] crop for `r`, in image coordinates
@@ -502,7 +641,8 @@ fn segmenter_applies(cfg: &Config, det: &FaceDetection) -> bool {
 /// per-face silhouette dilated 25% of the minor box side (square kernel) in
 /// **union** with the box ellipse (5% margin), so hair/skin never bleeds
 /// beyond the face box. `img` is the original RGB frame; the crop fed to the
-/// model is the same [`crop_clamped`] the classifier uses.
+/// model is the same [`crop_clamped`] the classifier uses. The union is
+/// assembled over one small bbox-local buffer — no full-frame allocation.
 fn segmenter_mask(
     w: u32,
     h: u32,
@@ -510,7 +650,7 @@ fn segmenter_mask(
     img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
     det: &FaceDetection,
     ellipse_margin: f32,
-) -> Result<image::GrayImage> {
+) -> Result<MaskRegion> {
     let pool = store
         .segmenter_pool()
         .ok_or_else(|| anyhow!("face-mask segmenter not loaded"))?;
@@ -525,15 +665,39 @@ fn segmenter_mask(
     let dilated =
         imageproc::morphology::dilate(&raw, imageproc::distance_transform::Norm::LInf, rad);
 
-    // Union with the box ellipse over the full frame.
-    let mut mask = mask_from_ellipse(w, h, det.bbox, ellipse_margin);
-    let (ox, oy) = clamped_crop_origin(w, h, det.bbox);
-    for (x, y, p) in dilated.enumerate_pixels() {
-        if p.0[0] > 0 {
-            mask.put_pixel(ox + x, oy + y, Luma([255u8]));
+    // Union extent (frame coords) of the dilated silhouette region and the box
+    // ellipse, recomputed within this per-face bbox.
+    let (sx, sy) = clamped_crop_origin(w, h, det.bbox);
+    let (sw, sh) = dilated.dimensions();
+    let ell_opt = ellipse_local(w, h, det.bbox, ellipse_margin);
+    let (mut ux0, mut uy0) = (sx, sy);
+    let (mut ux1, mut uy1) = (sx + sw.saturating_sub(1), sy + sh.saturating_sub(1));
+    if let Some((ell, (ex0, ey0))) = &ell_opt {
+        let (ew, eh) = ell.dimensions();
+        ux0 = ux0.min(*ex0);
+        uy0 = uy0.min(*ey0);
+        ux1 = ux1.max(ex0 + ew.saturating_sub(1));
+        uy1 = uy1.max(ey0 + eh.saturating_sub(1));
+    }
+    let mut mask = image::GrayImage::from_pixel(ux1 - ux0 + 1, uy1 - uy0 + 1, image::Luma([0u8]));
+    if let Some((ell, (ex0, ey0))) = &ell_opt {
+        let (ew, eh) = ell.dimensions();
+        for y in 0..eh {
+            for x in 0..ew {
+                if ell.get_pixel(x, y).0[0] > 0 {
+                    mask.put_pixel(ex0 + x - ux0, ey0 + y - uy0, Luma([255u8]));
+                }
+            }
         }
     }
-    Ok(mask)
+    for y in 0..sh {
+        for x in 0..sw {
+            if dilated.get_pixel(x, y).0[0] > 0 {
+                mask.put_pixel(x + sx - ux0, y + sy - uy0, Luma([255u8]));
+            }
+        }
+    }
+    Ok(mask_trim(mask, (ux0, uy0)))
 }
 
 /// Convex hull of the 5 keypoints (spec §4 ACTIVE polygonal blur).
@@ -574,6 +738,21 @@ pub fn crop_clamped(
     image::imageops::crop_imm(img, x0, y0, cw, ch).to_image()
 }
 
+/// Converts an RGB8 frame to RGBA (alpha 255) in one pass. The previous
+/// `DynamicImage::ImageRgb8(img.clone()).to_rgba8()` duplicated the RGB buffer
+/// (3 bytes/px) *and* allocated the RGBA one (4 bytes/px); this allocates only
+/// the RGBA buffer and fills it directly, removing a full-frame copy from the
+/// per-image hot path.
+fn rgb_to_rgba(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> image::RgbaImage {
+    let (w, h) = img.dimensions();
+    let rgb = img.as_raw();
+    let mut rgba = Vec::with_capacity((w as usize * h as usize) * 4);
+    for px in rgb.as_chunks::<3>().0 {
+        rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+    }
+    image::RgbaImage::from_raw(w, h, rgba).expect("RGB→RGBA buffer is exactly w*h*4 bytes")
+}
+
 /// Processes one RGB8 image according to the camera's FSM state.
 ///
 /// Returns the processed RGBA image plus metadata for persistence. This is
@@ -592,7 +771,7 @@ pub fn process_image(
     match state {
         CameraState::Initial => {
             // Cautious anonymization of the entire image (spec §4 INITIAL).
-            let mut rgba = DynamicImage::ImageRgb8(img.clone()).to_rgba8();
+            let mut rgba = rgb_to_rgba(img);
             op.apply_full_frame(&mut rgba);
             Ok(ProcessOutcome {
                 branch: Branch::Initial,
@@ -605,7 +784,7 @@ pub fn process_image(
         CameraState::Learning => {
             let detections = run_detector(cfg, store, img, cfg.yolo_conf_threshold)?;
 
-            let mut rgba = DynamicImage::ImageRgb8(img.clone()).to_rgba8();
+            let mut rgba = rgb_to_rgba(img);
             for det in &detections {
                 // Bounding box + fixed 15% margin per side (spec §4 LEARNING).
                 let margin = 0.15 * det.bbox.width().max(det.bbox.height());
@@ -641,7 +820,7 @@ pub fn process_image(
             let detections =
                 run_detector(cfg, store, img, cfg.yolo_conf_threshold_active)?;
 
-            let mut rgba = DynamicImage::ImageRgb8(img.clone()).to_rgba8();
+            let mut rgba = rgb_to_rgba(img);
             let mut kept: Vec<FaceDetection> = Vec::new();
 
             for det in &detections {
@@ -799,6 +978,154 @@ mod tests {
         image::ImageBuffer::from_pixel(w, h, image::Rgb([v, v, v]))
     }
 
+    /// Pre-optimization `box_blur_region` (re-reads the whole ±radius window
+    /// per pixel). Kept as the reference for the byte-identical check below.
+    fn box_blur_reference(img: &mut image::RgbaImage, region: Rect, radius: i64) {
+        let (w, h) = (img.width() as i64, img.height() as i64);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let x0 = (region.x0.floor() as i64).clamp(0, w - 1);
+        let y0 = (region.y0.floor() as i64).clamp(0, h - 1);
+        let x1 = (region.x1.ceil() as i64).clamp(0, w - 1);
+        let y1 = (region.y1.ceil() as i64).clamp(0, h - 1);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let rw = (x1 - x0 + 1) as usize;
+        let rh = (y1 - y0 + 1) as usize;
+        let mut tmp = vec![[0u32; 4]; rw * rh];
+
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let mut acc = [0u32; 4];
+                let mut count = 0u32;
+                for dx in (x - radius)..=(x + radius) {
+                    if dx < 0 || dx >= w {
+                        continue;
+                    }
+                    let p = img.get_pixel(dx as u32, y as u32);
+                    acc[0] += p.0[0] as u32;
+                    acc[1] += p.0[1] as u32;
+                    acc[2] += p.0[2] as u32;
+                    acc[3] += p.0[3] as u32;
+                    count += 1;
+                }
+                let idx = ((y - y0) as usize) * rw + (x - x0) as usize;
+                tmp[idx] = [
+                    acc[0] / count,
+                    acc[1] / count,
+                    acc[2] / count,
+                    acc[3] / count,
+                ];
+            }
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let mut acc = [0u32; 4];
+                let mut count = 0u32;
+                for dy in (y - radius)..=(y + radius) {
+                    if dy < y0 || dy > y1 {
+                        continue;
+                    }
+                    let idx = ((dy - y0) as usize) * rw + (x - x0) as usize;
+                    acc[0] += tmp[idx][0];
+                    acc[1] += tmp[idx][1];
+                    acc[2] += tmp[idx][2];
+                    acc[3] += tmp[idx][3];
+                    count += 1;
+                }
+                let p = img.get_pixel_mut(x as u32, y as u32);
+                p.0[0] = (acc[0] / count) as u8;
+                p.0[1] = (acc[1] / count) as u8;
+                p.0[2] = (acc[2] / count) as u8;
+                p.0[3] = (acc[3] / count) as u8;
+            }
+        }
+    }
+
+    /// The sliding-window blur must be byte-identical to the previous
+    /// implementation, including on partial windows (region touching the image
+    /// border, radius larger than the region) and on every channel.
+    #[test]
+    fn sliding_window_blur_is_byte_identical_to_reference() {
+        let mut img = DynamicImage::ImageRgb8(solid_img(160, 120, 30)).to_rgba8();
+        for (i, p) in img.pixels_mut().enumerate() {
+            let v = ((i * 37) % 251) as u8;
+            *p = Rgba([v, v.wrapping_mul(3), (255 - v), 255]);
+        }
+        let regions = [
+            Rect { x0: 10.0, y0: 8.0, x1: 150.0, y1: 112.0 }, // internal
+            Rect { x0: -5.0, y0: -5.0, x1: 200.0, y1: 200.0 }, // clamped to frame
+            Rect { x0: 40.0, y0: 40.0, x1: 41.0, y1: 41.0 },  // 8×8 minimum region
+            Rect { x0: 0.0, y0: 0.0, x1: 159.0, y1: 119.0 },  // whole frame
+        ];
+        for region in regions {
+            for radius in [2i64, 3, 8, 25, 75] {
+                let mut fast = img.clone();
+                let mut reference = img.clone();
+                box_blur_region(&mut fast, region, radius);
+                box_blur_reference(&mut reference, region, radius);
+                assert_eq!(
+                    fast.as_raw(),
+                    reference.as_raw(),
+                    "region {region:?} radius {radius}"
+                );
+            }
+        }
+    }
+
+    /// Cost measurement, not part of the normal suite:
+    /// `cargo test --release -- --ignored blur_cost`.
+    #[test]
+    #[ignore]
+    fn blur_cost_sliding_window_vs_reference() {
+        let mut img = DynamicImage::ImageRgb8(solid_img(1920, 1080, 30)).to_rgba8();
+        let region = Rect { x0: 800.0, y0: 400.0, x1: 1100.0, y1: 700.0 };
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            blur_region_rgba(&mut img, region, 50.0); // sigma 50 ⇒ radius 75, 2 passate
+        }
+        let sliding = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            box_blur_reference(&mut img, region, 75);
+            box_blur_reference(&mut img, region, 75);
+        }
+        let reference = t.elapsed();
+        println!("20 volto 300x300 @ sigma 50 — sliding: {sliding:?}, riferimento: {reference:?}");
+    }
+
+    /// Cost measurement for the bbox-local ACTIVE mask path, not part of the
+    /// normal suite: `cargo test --release -- --ignored active_bbox_mask_cost`.
+    /// Absolute per-face cost of the *new* path (face-sized buffers, no
+    /// full-frame scan); compare the same run on a previous build to quantify
+    /// the bbox-local gain (the old path additionally allocated a `w×h` mask
+    /// and scanned the full frame per face).
+    #[test]
+    #[ignore]
+    fn active_bbox_mask_cost() {
+        let mut img = DynamicImage::ImageRgb8(solid_img(1920, 1080, 30)).to_rgba8();
+        let op = AnonOp::Blur(50.0);
+        let t = std::time::Instant::now();
+        for i in 0..50u32 {
+            let cx = 140.0 + (i % 8) as f32 * 220.0;
+            let cy = 160.0 + (i / 8) as f32 * 190.0;
+            let face = Rect {
+                x0: cx,
+                y0: cy,
+                x1: cx + 160.0,
+                y1: cy + 240.0,
+            };
+            let region = mask_from_ellipse(1920, 1080, face, 0.08);
+            op.apply_masked(&mut img, &region, 24.0);
+        }
+        println!(
+            "50 masked 160×240 faces @1080p, sigma 50: {:?}",
+            t.elapsed()
+        );
+    }
+
     #[test]
     fn sigma_formula_and_clamp() {
         assert!((sigma_for_box(80.0) - 20.0).abs() < 1e-5);
@@ -951,16 +1278,16 @@ mod tests {
             },
             0.0,
         );
-        assert_eq!(m.get_pixel(50, 50).0[0], 255);
-        assert_eq!(m.get_pixel(26, 26).0[0], 0); // corner of bbox outside ellipse
+        assert_eq!(m.frame_pixel(50, 50).0[0], 255);
+        assert_eq!(m.frame_pixel(26, 26).0[0], 0); // corner of bbox outside ellipse
     }
 
     #[test]
     fn polygon_mask_covers_hull() {
         let poly = vec![(10.0, 10.0), (90.0, 10.0), (50.0, 90.0)];
         let m = mask_from_polygon(100, 100, &poly, 0.0);
-        assert_eq!(m.get_pixel(50, 30).0[0], 255);
-        assert_eq!(m.get_pixel(5, 90).0[0], 0);
+        assert_eq!(m.frame_pixel(50, 30).0[0], 255);
+        assert_eq!(m.frame_pixel(5, 90).0[0], 0);
     }
 
     #[test]
@@ -1070,15 +1397,16 @@ mod tests {
             Some(pool),
         );
         let mask = segmenter_mask(w, h, &store, &img, &det, 0.05).unwrap();
-        assert_eq!(mask.dimensions(), (w, h));
+        // Bbox-local: strictly smaller than the frame, always inside it.
+        assert!(mask.mask.width() <= w && mask.mask.height() <= h);
         // Silhouette covers the face center.
-        assert_eq!(mask.get_pixel(665, 215).0[0], 255);
+        assert_eq!(mask.frame_pixel(665, 215).0[0], 255);
         // The union is a superset of the plain box ellipse.
         let ell = mask_from_ellipse(w, h, det.bbox, 0.05);
-        let covered = mask.iter().filter(|&&v| v > 0).count();
-        let ell_covered = ell.iter().filter(|&&v| v > 0).count();
+        let covered = mask.mask.iter().filter(|&&v| v > 0).count();
+        let ell_covered = ell.mask.iter().filter(|&&v| v > 0).count();
         assert!(covered >= ell_covered, "{covered} < {ell_covered}");
         // Far from the face the frame stays uncovered.
-        assert_eq!(mask.get_pixel(100, 5).0[0], 0);
+        assert_eq!(mask.frame_pixel(100, 5).0[0], 0);
     }
 }

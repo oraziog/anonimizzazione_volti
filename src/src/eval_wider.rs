@@ -632,8 +632,7 @@ mod tests {
 
     #[test]
     fn gt_parser_roundtrip() {
-        let dir = std::env::temp_dir().join("av-eval-gt-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::TempDir::new("wider_gt_test");
         let path = dir.join("gt.txt");
         std::fs::write(
             &path,

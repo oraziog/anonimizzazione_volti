@@ -329,8 +329,7 @@ mod tests {
 
     #[test]
     fn fold_parser_roundtrip() {
-        let dir = std::env::temp_dir().join("av-fddb-fold-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::TempDir::new("fddb_fold_test");
         let fold = dir.join("FDDB-fold-01.txt");
         std::fs::write(
             &fold,

@@ -38,6 +38,13 @@ pub const JOBS_LEDGER_FILENAME: &str = "jobs.jsonl";
 /// Cap on ledger lines: appends beyond this rotate the file (keep the newest
 /// half), so the file and `GET /operator/jobs` stay cheap forever.
 pub const JOBS_LEDGER_MAX_LINES: usize = 1000;
+/// Conservative estimate of the average serialized size of one ledger entry,
+/// used only as the rotation threshold: the (rare) rewrite is triggered when
+/// the file passes `JOBS_LEDGER_MAX_LINES` × this. Deliberately below the real
+/// entry size (a few hundred bytes of JSON including two timestamps), so the
+/// ledger rotates *at or before* the documented line cap instead of growing
+/// past it.
+const JOBS_LEDGER_BYTES_PER_LINE: u64 = 200;
 
 /// One finished job, as recorded in the ledger and served by `/operator/jobs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,10 +216,13 @@ pub fn run_retention(cfg: &Config) -> Result<RetentionReport> {
 
 // ─── Jobs ledger ─────────────────────────────────────────────────────────────
 
-/// Appends one finished job to `DATA_DIR/jobs.jsonl`, rotating to the newest
-/// [`JOBS_LEDGER_MAX_LINES`] lines when the cap is exceeded. Called from the
-/// `/anonymize` and `/anonymize/batch` handlers (the single-job lock
-/// guarantees a single writer).
+/// Appends one finished job to `DATA_DIR/jobs.jsonl`, rewrites the file only
+/// to rotate it (keeping the newest half) once it grows past
+/// `JOBS_LEDGER_MAX_LINES` × `JOBS_LEDGER_BYTES_PER_LINE` bytes. Called from
+/// the `/anonymize` and `/anonymize/batch` handlers (the single-job lock
+/// guarantees a single writer); the append keeps the per-job cost O(1) instead
+/// of read-all + rewrite-all, which mattered because the ledger holds up to
+/// [`JOBS_LEDGER_MAX_LINES`] entries.
 pub fn record_job(
     data_dir: &Path,
     input: &str,
@@ -241,21 +251,42 @@ pub fn record_job(
         on_disk: false,
     };
 
+    use std::io::Write;
+
     let path = data_dir.join(JOBS_LEDGER_FILENAME);
-    let mut lines: Vec<String> = match std::fs::read_to_string(&path) {
-        Ok(text) => text
+    // Append one line: no read of the existing ledger, no per-line `String`
+    // clone, no full rewrite on the common path.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open jobs ledger {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(&entry)?)
+        .with_context(|| format!("write jobs ledger {}", path.display()))?;
+    file.flush().ok();
+
+    // Rotation is the only operation that still rewrites the file: it runs
+    // once every ~`JOBS_LEDGER_MAX_LINES` jobs, when the size threshold is
+    // crossed, and keeps the newest half (the previous policy).
+    let oversized = file
+        .metadata()
+        .map(|m| m.len() > (JOBS_LEDGER_MAX_LINES as u64) * JOBS_LEDGER_BYTES_PER_LINE)
+        .unwrap_or(false);
+    if oversized {
+        drop(file);
+        let newest_first: Vec<String> = std::fs::read_to_string(&path)
+            .with_context(|| format!("read jobs ledger {}", path.display()))?
             .lines()
-            .map(str::to_string)
             .filter(|l| !l.trim().is_empty())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    lines.push(serde_json::to_string(&entry)?);
-    if lines.len() > JOBS_LEDGER_MAX_LINES {
-        lines.drain(..lines.len() - JOBS_LEDGER_MAX_LINES / 2);
+            .rev()
+            .take(JOBS_LEDGER_MAX_LINES / 2)
+            .map(str::to_string)
+            .collect();
+        let kept: Vec<String> = newest_first.into_iter().rev().collect();
+        std::fs::write(&path, kept.join("\n") + "\n")
+            .with_context(|| format!("rotate jobs ledger {}", path.display()))?;
     }
-    std::fs::write(&path, lines.join("\n") + "\n")
-        .with_context(|| format!("write jobs ledger {}", path.display()))
+    Ok(())
 }
 
 /// Reads the ledger in file order (oldest first). Invalid / torn lines are
@@ -279,18 +310,9 @@ pub fn read_jobs_ledger(data_dir: &Path) -> Result<Vec<JobLedgerEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "av_retention_test_{tag}_{}_{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Unique per run and removed on drop; see `crate::testutil`.
+    fn temp_dir(tag: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("retention_test_{tag}"))
     }
 
     fn write_aged(path: &Path, data: &[u8], age_secs: u64) {
@@ -316,7 +338,7 @@ mod tests {
         std::fs::write(&unrelated, b"db").unwrap();
 
         let mut cfg = Config::test_default();
-        cfg.data_dir = dir.clone();
+        cfg.data_dir = dir.to_path_buf();
         cfg.retention_enabled = true;
         cfg.retention_max_days = 30;
         cfg.retention_max_gb = 0.0; // size rule off
@@ -343,7 +365,7 @@ mod tests {
             write_aged(&dir.join(name), &vec![0u8; 1024], age);
         }
         let mut cfg = Config::test_default();
-        cfg.data_dir = dir.clone();
+        cfg.data_dir = dir.to_path_buf();
         cfg.retention_enabled = true;
         cfg.retention_max_days = 0;
         // ~2.68 KB threshold: total is 3 KB → exactly one 1 KB eviction.
@@ -382,7 +404,7 @@ mod tests {
         let p = dir.join("x_elaborato.zip");
         write_aged(&p, b"data", 400 * 86_400);
         let mut cfg = Config::test_default();
-        cfg.data_dir = dir.clone();
+        cfg.data_dir = dir.to_path_buf();
         cfg.retention_enabled = false;
         cfg.retention_max_days = 1;
         cfg.retention_max_gb = 0.0;
@@ -443,6 +465,15 @@ mod tests {
         assert_eq!(
             last.output,
             format!("z{}_elaborato.zip", JOBS_LEDGER_MAX_LINES + 19)
+        );
+        // The file itself stays bounded too (rotation is byte-triggered), so
+        // `GET /operator/jobs` never has to read an unbounded ledger.
+        let size = std::fs::metadata(dir.join(JOBS_LEDGER_FILENAME))
+            .unwrap()
+            .len();
+        assert!(
+            size <= 2 * (JOBS_LEDGER_MAX_LINES as u64) * JOBS_LEDGER_BYTES_PER_LINE,
+            "ledger file grew to {size} bytes"
         );
     }
 }

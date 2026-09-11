@@ -11,7 +11,7 @@
 
 //! When `S3_ENDPOINT` is empty (real AWS) virtual-hosted style is kept.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -182,7 +182,20 @@ impl S3Client {
     }
 
     /// Streams `s3://bucket/key` to a local file, returning the byte count.
-    pub async fn download_streaming(&self, bucket: &str, key: &str, dest: &Path) -> Result<u64> {
+    ///
+    /// `max_bytes` bounds the local copy (0 = unlimited), the same class of
+    /// guard as the archive caps: the object is producer-controlled data, so an
+    /// oversized one must not be able to fill the scratch disk. The check runs
+    /// against the `Content-Length` first (fail before writing anything) and
+    /// again per chunk (a lying header cannot get past it); the partial file is
+    /// removed on the way out.
+    pub async fn download_streaming(
+        &self,
+        bucket: &str,
+        key: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<u64> {
         let response = self
             .client
             .get_object()
@@ -192,6 +205,16 @@ impl S3Client {
             .await
             .with_context(|| format!("download s3://{bucket}/{key}"))?;
 
+        if max_bytes > 0 {
+            if let Some(len) = response.content_length() {
+                if len as u64 > max_bytes {
+                    return Err(anyhow!(
+                        "s3://{bucket}/{key} is {len} bytes, above MAX_ARCHIVE_BYTES ({max_bytes})"
+                    ));
+                }
+            }
+        }
+
         let mut file = tokio::fs::File::create(dest)
             .await
             .with_context(|| format!("create local destination {}", dest.display()))?;
@@ -199,10 +222,17 @@ impl S3Client {
         let mut size = 0u64;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read S3 download chunk")?;
+            size += chunk.len() as u64;
+            if max_bytes > 0 && size > max_bytes {
+                drop(file);
+                let _ = tokio::fs::remove_file(dest).await;
+                return Err(anyhow!(
+                    "s3://{bucket}/{key} exceeds MAX_ARCHIVE_BYTES ({max_bytes}) while downloading"
+                ));
+            }
             file.write_all(&chunk)
                 .await
                 .with_context(|| format!("write {}", dest.display()))?;
-            size += chunk.len() as u64;
         }
         file.flush().await.ok();
         tracing::info!("downloaded s3://{bucket}/{key} ({size} bytes)");

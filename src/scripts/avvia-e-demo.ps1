@@ -33,7 +33,24 @@ $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 # --- 1. Compila --------------------------------------------------------------
 Write-Host "==> Build ($(if ($Release) { 'release' } else { 'debug' }))..."
 if ($Release) { cargo build --release | Out-Host } else { cargo build | Out-Host }
-$exe = Join-Path $Root "target\$(if ($Release) { 'release' } else { 'debug' })\anonimizzazione_volti.exe"
+# La crate vive in un workspace (../Cargo.toml): cargo scrive gli artefatti in
+# <workspace>/target, NON in <crate>/target. Interroga `cargo metadata` per il
+# percorso reale, con fallback alle due posizioni note.
+function Resolve-BinPath([string]$CrateRoot, [string]$Profile) {
+    $name = "anonimizzazione_volti.exe"
+    $candidates = @()
+    try {
+        $meta = (& cargo metadata --no-deps --format-version 1 2>$null) | ConvertFrom-Json
+        if ($meta.target_directory) {
+            $candidates += (Join-Path $meta.target_directory "$Profile\$name")
+        }
+    } catch { }
+    $candidates += (Join-Path $CrateRoot "target\$Profile\$name")
+    foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { return $c } }
+    return $candidates[0]
+}
+$profile = $(if ($Release) { "release" } else { "debug" })
+$exe = Resolve-BinPath -CrateRoot $Root -Profile $profile
 if (-not (Test-Path $exe)) { throw "Binario non trovato: $exe" }
 
 # --- 2. Prepara lo ZIP di test (se non esiste) -------------------------------

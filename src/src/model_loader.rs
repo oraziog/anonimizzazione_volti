@@ -29,6 +29,116 @@ fn normalize_sha(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
+/// Download policy for every model (hardening): the scheme, the SHA-256
+/// requirement and the redirect budget are all part of `Config` so an operator
+/// can tighten them without a code change.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelPolicy {
+    /// Allow plain `http://` for non-loopback hosts (env `MODEL_ALLOW_HTTP`,
+    /// default false). Loopback is always allowed: a `http://127.0.0.1:port/…`
+    /// URL cannot be MITM'd off-host and is how the local model server works.
+    pub allow_http: bool,
+    /// Refuse to resolve a model that has no `MODEL_*_SHA256` configured
+    /// (env `MODEL_SHA_REQUIRED`, default false). Turn on in production.
+    pub sha_required: bool,
+    /// Max redirects followed while downloading (env `MODEL_MAX_REDIRECTS`).
+    pub max_redirects: usize,
+}
+
+impl Default for ModelPolicy {
+    fn default() -> Self {
+        Self {
+            allow_http: false,
+            sha_required: false,
+            max_redirects: 2,
+        }
+    }
+}
+
+/// True for host names/addresses that only ever live on this machine, where a
+/// plain `http://` download cannot be intercepted by a network attacker.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Validates a model URL *before* any request is made: only `https://` (or
+/// `http://` on loopback / when `MODEL_ALLOW_HTTP=true`), no embedded
+/// credentials. This closes the "URL controlled ⇒ arbitrary ONNX" path.
+pub fn validate_model_url(url: &str, policy: &ModelPolicy) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| anyhow!("invalid model URL: {e}"))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let loopback = parsed.host_str().map(is_loopback_host).unwrap_or(false);
+            if !loopback && !policy.allow_http {
+                return Err(anyhow!(
+                    "model URL must use https:// (set MODEL_ALLOW_HTTP=true to override, \
+                     not recommended over a network)"
+                ));
+            }
+            if !loopback {
+                tracing::warn!(
+                    "model URL uses plain http:// (MODEL_ALLOW_HTTP=true): the model can be \
+                     replaced by anyone able to intercept the connection"
+                );
+            }
+        }
+        other => {
+            return Err(anyhow!(
+                "unsupported model URL scheme '{other}://' — only https:// is accepted"
+            ))
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow!("model URL must not embed credentials"));
+    }
+    Ok(())
+}
+
+/// Safe cache file name for a model URL: last path segment, reduced to a
+/// conservative charset, never `.`/`..`/empty (a `../../x` URL must not be
+/// able to write outside `MODEL_CACHE_DIR`).
+fn model_filename(url: &str) -> String {
+    let last = url
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    let cleaned: String = last
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    match cleaned.trim_matches('.') {
+        "" => "model.onnx".to_string(),
+        name => name.to_string(),
+    }
+}
+
+/// Builds the HTTP client used for model downloads: connect timeout, a
+/// **bounded** redirect policy (`policy.max_redirects`, 0 = follow none) and the
+/// versioned user agent. Returns the client for reuse across models.
+pub fn build_client(policy: &ModelPolicy) -> Result<reqwest::Client> {
+    let redirects = if policy.max_redirects == 0 {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::limited(policy.max_redirects)
+    };
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .redirect(redirects)
+        .user_agent("anonimizzazione-volti/0.1")
+        .build()
+        .context("build HTTP client")
+}
+
 /// Downloads `url` to `dest_path` streaming to disk, retrying up to
 /// `max_attempts` times with exponential backoff (spec §3: max 3 tentativi).
 async fn download_with_retry(
@@ -61,9 +171,15 @@ async fn download_once(client: &reqwest::Client, url: &str, dest_path: &Path) ->
         .timeout(Duration::from_secs(600))
         .send()
         .await
-        .context("send request")?
-        .error_for_status()
-        .with_context(|| format!("HTTP error downloading {url}"))?;
+        .context("send request")?;
+    // Only a 2xx is a model. With redirects disabled (`MODEL_MAX_REDIRECTS=0`)
+    // a 302 must be an error rather than a bodyless "model" that only fails
+    // later in the ONNX/SHA gate; a redirect that was followed within the
+    // budget still ends here with the final status.
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {status} downloading {url}"));
+    }
 
     let mut file = tokio::fs::File::create(&tmp_path)
         .await
@@ -92,15 +208,18 @@ pub async fn ensure_model(
     url: &str,
     expected_sha: Option<&str>,
     cache_dir: &Path,
+    policy: &ModelPolicy,
 ) -> Result<ResolvedModel> {
+    validate_model_url(url, policy)?;
+    if policy.sha_required && expected_sha.is_none() {
+        return Err(anyhow!(
+            "MODEL_SHA_REQUIRED=true but no SHA-256 is configured for {url} — set the matching \
+             MODEL_*_SHA256 (or MODEL_SHA_REQUIRED=false, not recommended)"
+        ));
+    }
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
-    let filename = url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("model.onnx");
-    let dest_path = cache_dir.join(filename);
+    let dest_path = cache_dir.join(model_filename(url));
 
     if dest_path.exists() {
         let cached = tokio::fs::read(&dest_path).await?;
@@ -349,6 +468,36 @@ mod tests {
         assert!(looks_like_onnx(&model_bytes));
         assert!(!looks_like_onnx(b"<html>404 not found</html>"));
         assert!(!looks_like_onnx(b"short"));
+    }
+
+    #[test]
+    fn model_url_policy_is_fail_closed() {
+        let strict = ModelPolicy::default();
+        assert!(validate_model_url("https://example.com/a.onnx", &strict).is_ok());
+        assert!(validate_model_url("http://example.com/a.onnx", &strict).is_err());
+        assert!(validate_model_url("file:///etc/passwd", &strict).is_err());
+        assert!(validate_model_url("ftp://example.com/a.onnx", &strict).is_err());
+        assert!(validate_model_url("https://u:p@example.com/a.onnx", &strict).is_err());
+        // Loopback http is the local model server: always allowed.
+        assert!(validate_model_url("http://127.0.0.1:8765/m.onnx", &strict).is_ok());
+        assert!(validate_model_url("http://localhost:8765/m.onnx", &strict).is_ok());
+        assert!(validate_model_url("http://[::1]:8765/m.onnx", &strict).is_ok());
+        // Opt-in plain http for non-loopback hosts.
+        let lax = ModelPolicy {
+            allow_http: true,
+            ..ModelPolicy::default()
+        };
+        assert!(validate_model_url("http://example.com/a.onnx", &lax).is_ok());
+    }
+
+    #[test]
+    fn model_filename_cannot_escape_the_cache_dir() {
+        assert_eq!(model_filename("https://h/a/model.onnx"), "model.onnx");
+        assert_eq!(model_filename("https://h/a/model.onnx?x=1"), "model.onnx");
+        assert_eq!(model_filename("https://h/../../etc/passwd"), "passwd");
+        assert_eq!(model_filename("https://h/.."), "model.onnx");
+        assert_eq!(model_filename("https://h/"), "model.onnx");
+        assert!(!model_filename("https://h/a/..%2f..%2fx").contains('/'));
     }
 
     #[test]

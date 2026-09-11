@@ -227,13 +227,47 @@ pub struct ZipJobOutcome {
     pub errors: Vec<ArchiveEntryError>,
 }
 
+/// Per-image concurrency gate. Its capacity is re-evaluated from the current
+/// runtime snapshot at the start of every job, so a capacity knob change is
+/// honored without restarting the process (a plain `Semaphore` would have
+/// stayed frozen at the value seen by `ZipProcessor::new` forever). Recreating
+/// the tokio semaphore is the only way to resize it; already-issued permits
+/// keep their old semaphore, which simply caps the in-flight batch.
+#[derive(Clone)]
+struct PerImageSemaphore {
+    inner: std::sync::Arc<std::sync::Mutex<(usize, Arc<Semaphore>)>>,
+}
+
+impl PerImageSemaphore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new((
+                capacity,
+                Arc::new(Semaphore::new(capacity)),
+            ))),
+        }
+    }
+
+    /// Returns a live `Arc<Semaphore>` matching `desired`, rebuilding it when
+    /// the capacity moved. The lock is held only for the O(1) swap — never
+    /// across an `.await`.
+    fn refresh(&self, desired: usize) -> Arc<Semaphore> {
+        let mut guard = self.inner.lock().expect("per-image semaphore poisoned");
+        if desired != guard.0 {
+            guard.0 = desired;
+            guard.1 = Arc::new(Semaphore::new(desired));
+        }
+        guard.1.clone()
+    }
+}
+
 /// The bounded-concurrency ZIP processor (spec §2, §9).
 #[derive(Clone)]
 pub struct ZipProcessor {
     cfg: RuntimeConfig,
     db: Db,
     store: ModelStore,
-    semaphore: Arc<Semaphore>,
+    semaphore: PerImageSemaphore,
     errors: Arc<AtomicUsize>,
 }
 
@@ -250,9 +284,19 @@ impl ZipProcessor {
             cfg,
             db,
             store,
-            semaphore: Arc::new(Semaphore::new(capacity)),
+            semaphore: PerImageSemaphore::new(capacity),
             errors: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Acquires one per-image permit, refreshing the concurrency gate against
+    /// the live runtime snapshot first.
+    async fn acquire_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let capacity = self.cfg.snapshot().effective_concurrency();
+        let sem = self.semaphore.refresh(capacity);
+        sem.acquire_owned()
+            .await
+            .map_err(|_| anyhow!("semaphore closed"))
     }
 
     pub fn error_count(&self) -> usize {
@@ -264,6 +308,13 @@ impl ZipProcessor {
     #[cfg(feature = "s3")]
     pub fn data_dir(&self) -> std::path::PathBuf {
         self.cfg.snapshot().data_dir.clone()
+    }
+
+    /// Live `MAX_ARCHIVE_BYTES` (the S3 worker applies it to object downloads
+    /// as well, so a bucket object cannot fill the scratch disk).
+    #[cfg(feature = "s3")]
+    pub fn max_archive_bytes(&self) -> u64 {
+        self.cfg.snapshot().max_archive_bytes
     }
 
     /// Resolves a camera row once per camera id per job: the first image of a
@@ -319,6 +370,9 @@ impl ZipProcessor {
         let mut entry_errors: Vec<ArchiveEntryError> = Vec::new();
         let mut archive =
             zip::ZipArchive::new(reader).context("uploaded file is not a readable ZIP archive")?;
+        let limits = ArchiveLimits::from_cfg(&self.cfg.snapshot());
+        // Entry-count guard, before any per-entry work is scheduled.
+        limits.check_entry_count(archive.len())?;
 
         // Pass 1: classify every entry (no reads). Directories are structural;
         // anything unsupported is a logged, counted error that never aborts.
@@ -368,18 +422,22 @@ impl ZipProcessor {
         // borrowed by this loop); decode + inference + blur run in parallel
         // under the semaphore.
         let mut cam_cache: HashMap<String, Camera> = HashMap::new();
+        // Cumulative decompressed bytes, checked against the archive budget.
+        let mut decompressed: u64 = 0;
         for (idx, target) in image_entries.into_iter() {
-            let permit = self
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("semaphore closed"))?;
+            let permit = self.acquire_permit().await?;
 
             // Reads are kept inside a synchronous helper: `ZipFile` owns a
             // boxed `dyn Read` (not Send) and must never cross an `.await`.
-            let bytes = match read_entry_bytes(&mut archive, idx) {
+            let bytes = match read_entry_bytes(&mut archive, idx, &limits, decompressed) {
                 Ok(b) => b,
+                // A cap violation means the archive is hostile (or corrupt in a
+                // way that implies unbounded expansion): abort the job rather
+                // than skipping the entry and carrying on.
+                Err(e) if is_limit_exceeded(&e) => {
+                    tracing::error!("job '{input_name}' aborted: {e}");
+                    return Err(e);
+                }
                 Err(e) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
                     entry_errors.push(ArchiveEntryError {
@@ -391,6 +449,7 @@ impl ZipProcessor {
                     continue;
                 }
             };
+            decompressed += bytes.len() as u64;
 
             // Camera FSM bookkeeping lives on the async side (sqlx).
             let cam = match self.camera_for(&mut cam_cache, &target.camera_id).await {
@@ -616,19 +675,22 @@ impl ZipProcessor {
         let job_stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f").to_string();
         let scratch = self.cfg.snapshot().data_dir.join(format!("tmp_7z_{job_stamp}"));
         std::fs::create_dir_all(&scratch).context("create 7z scratch dir")?;
+        // Guard: a failed extraction (`?` below) must not leave the scratch dir
+        // behind — nothing else ever prunes it.
+        let _scratch_guard = CleanupPath::dir(scratch.clone());
 
         // Decompression is CPU/IO-bound and never touches the async runtime.
         let path2 = path.to_path_buf();
         let scratch2 = scratch.clone();
+        let limits = ArchiveLimits::from_cfg(&self.cfg.snapshot());
         let decompressed =
-            tokio::task::spawn_blocking(move || decompress_7z_file(&path2, &scratch2))
+            tokio::task::spawn_blocking(move || decompress_7z_file(&path2, &scratch2, limits))
                 .await
                 .map_err(|e| anyhow!("7z extraction worker panicked: {e}"))??;
 
         let outcome = self
             .process_extracted_dir(input_name, &scratch, decompressed, job_stamp, entry_errors)
             .await;
-        let _ = std::fs::remove_dir_all(&scratch);
         outcome
     }
 
@@ -642,18 +704,33 @@ impl ZipProcessor {
         let job_stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f").to_string();
         let scratch = self.cfg.snapshot().data_dir.join(format!("tmp_rar_{job_stamp}"));
         std::fs::create_dir_all(&scratch).context("create rar scratch dir")?;
+        let _scratch_guard = CleanupPath::dir(scratch.clone());
 
         let path2 = path.to_path_buf();
         let scratch2 = scratch.clone();
-        let decompressed = tokio::task::spawn_blocking(move || decompress_rar(&path2, &scratch2))
+        let limits = ArchiveLimits::from_cfg(&self.cfg.snapshot());
+        let decompressed = tokio::task::spawn_blocking(move || decompress_rar(&path2, &scratch2, limits))
             .await
             .map_err(|e| anyhow!("rar extraction worker panicked: {e}"))??;
 
         let outcome = self
             .process_extracted_dir(input_name, &scratch, decompressed, job_stamp, entry_errors)
             .await;
-        let _ = std::fs::remove_dir_all(&scratch);
         outcome
+    }
+
+    /// Reads one extracted file under the per-entry byte cap. The extraction
+    /// step already enforced the archive-wide budget; this is defense in depth
+    /// (a file that changed between extraction and read).
+    fn read_extracted(&self, path: &std::path::Path, limits: &ArchiveLimits) -> Result<Vec<u8>> {
+        let cap = if limits.max_entry_bytes == 0 {
+            u64::MAX
+        } else {
+            limits.max_entry_bytes
+        };
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow!("cannot open extracted file: {e}"))?;
+        read_capped(file, cap, &format!("extracted file '{}'", path.display()))
     }
 
     /// Shared driver for scratch-dir archives (.7z/.rar): walk the extracted
@@ -667,6 +744,9 @@ impl ZipProcessor {
         job_stamp: String,
         mut entry_errors: Vec<ArchiveEntryError>,
     ) -> Result<ZipJobOutcome> {
+        let limits = ArchiveLimits::from_cfg(&self.cfg.snapshot());
+        limits.check_entry_count(entries.len())?;
+
         // Classify every extracted path (no reads).
         let mut image_entries: Vec<(std::path::PathBuf, EntryTarget)> = Vec::new();
         for (rel, is_dir) in entries {
@@ -718,15 +798,14 @@ impl ZipProcessor {
         // Pass 2: read from disk + schedule under the semaphore.
         let mut cam_cache: HashMap<String, Camera> = HashMap::new();
         for (path, target) in image_entries.into_iter() {
-            let permit = self
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("semaphore closed"))?;
+            let permit = self.acquire_permit().await?;
 
-            let bytes = match std::fs::read(&path) {
+            let bytes = match self.read_extracted(&path, &limits) {
                 Ok(b) => b,
+                Err(e) if is_limit_exceeded(&e) => {
+                    tracing::error!("job '{input_name}' aborted: {e}");
+                    return Err(e);
+                }
                 Err(e) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
                     entry_errors.push(ArchiveEntryError {
@@ -929,7 +1008,12 @@ fn finalize_zip(
 fn decompress_7z_file(
     path: &std::path::Path,
     out_dir: &std::path::Path,
+    limits: ArchiveLimits,
 ) -> Result<Vec<(String, bool)>> {
+    // 7z exposes no per-entry compressed size, so only the count, the
+    // per-entry cap and the archive-wide decompression budget apply here (the
+    // ratio check is ZIP-only).
+    let mut total: u64 = 0;
     let file = std::fs::File::open(path).context("open spooled 7z archive")?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = sevenz_rust::SevenZReader::new(file, len, sevenz_rust::Password::empty())
@@ -962,11 +1046,28 @@ fn decompress_7z_file(
                     return Ok(false);
                 }
             }
-            let mut buf = Vec::new();
-            if let Err(e) = content.read_to_end(&mut buf) {
-                aborted = Some(format!("cannot read 7z entry '{name}': {e}"));
+            if limits.max_entries > 0 && entries.len() > limits.max_entries {
+                aborted = Some(format!(
+                    "7z archive has more than MAX_ENTRIES_PER_ARCHIVE ({}) entries",
+                    limits.max_entries
+                ));
                 return Ok(false);
             }
+            let cap = match limits.entry_read_cap(total) {
+                Ok(c) => c,
+                Err(e) => {
+                    aborted = Some(format!("{e}"));
+                    return Ok(false);
+                }
+            };
+            let buf = match read_capped(content, cap, &format!("7z entry '{name}'")) {
+                Ok(b) => b,
+                Err(e) => {
+                    aborted = Some(format!("{e}"));
+                    return Ok(false);
+                }
+            };
+            total += buf.len() as u64;
             if let Err(e) = std::fs::write(&dest, &buf) {
                 aborted = Some(format!("cannot write {}: {e}", dest.display()));
                 return Ok(false);
@@ -990,8 +1091,11 @@ fn decompress_7z_file(
 fn decompress_rar(
     rar_path: &std::path::Path,
     out_dir: &std::path::Path,
+    limits: ArchiveLimits,
 ) -> Result<Vec<(String, bool)>> {
     let mut entries: Vec<(String, bool)> = Vec::new();
+    // Decompressed-bytes budget for the whole archive.
+    let mut total: u64 = 0;
     let mut open = unrar::Archive::new(rar_path)
         .open_for_processing()
         .map_err(|e| anyhow!("invalid RAR archive: {e}"))?;
@@ -1012,9 +1116,26 @@ fn decompress_rar(
                 .map_err(|e| anyhow!("cannot skip RAR dir: {e}"))?;
             continue;
         }
+        // Caps checked *before* the crate buffers the entry: entry count,
+        // declared unpacked size and what is left of the archive budget.
+        if limits.max_entries > 0 && entries.len() > limits.max_entries {
+            anyhow::bail!(
+                "RAR archive has more than MAX_ENTRIES_PER_ARCHIVE ({}) entries",
+                limits.max_entries
+            );
+        }
+        let cap = limits.entry_read_cap(total)?;
+        let declared = next.entry().unpacked_size;
+        if declared > cap {
+            anyhow::bail!("RAR entry '{name}' declares {declared} bytes, above the {cap}-byte limit");
+        }
         let (content, next_open) = next
             .read()
             .map_err(|e| anyhow!("cannot read RAR entry '{name}': {e}"))?;
+        if content.len() as u64 > cap {
+            anyhow::bail!("RAR entry '{name}' exceeds the {cap}-byte limit");
+        }
+        total += content.len() as u64;
 
         let mut dest = out_dir.to_path_buf();
         let mut safe = true;
@@ -1051,35 +1172,182 @@ fn decompress_rar(
 /// independent decoder (liblzma for LZMA/XZ, libbz2, libzstd, the deflate64
 /// crate), accepting only a decode whose CRC32 and size match the entry's
 /// stored metadata — so archives from any tool always decode or fail loudly.
+/// Resource caps enforced while reading an archive (zip-bomb / exhaustion
+/// guard). Built from the `MAX_*` knobs; a zero field disables that check.
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveLimits {
+    pub max_entries: usize,
+    pub max_entry_bytes: u64,
+    pub max_total_uncompressed: u64,
+    pub max_ratio: u64,
+}
+
+impl ArchiveLimits {
+    pub fn from_cfg(cfg: &crate::config::Config) -> Self {
+        Self {
+            max_entries: cfg.max_entries_per_archive,
+            max_entry_bytes: cfg.max_entry_bytes,
+            max_total_uncompressed: cfg.max_total_uncompressed_bytes,
+            max_ratio: cfg.max_compression_ratio,
+        }
+    }
+
+    /// Limits matching the shipped defaults, for tests.
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self::from_cfg(&crate::config::Config::test_default())
+    }
+
+    fn check_entry_count(&self, entries: usize) -> Result<()> {
+        if self.max_entries > 0 && entries > self.max_entries {
+            return Err(limit_err(format!(
+                "archive has {entries} entries, above MAX_ENTRIES_PER_ARCHIVE ({})",
+                self.max_entries
+            )));
+        }
+        Ok(())
+    }
+
+    /// Budget left for one entry read: the per-entry cap, further limited by
+    /// what is left of the archive-wide decompression budget.
+    fn entry_read_cap(&self, already: u64) -> Result<u64> {
+        let by_entry = if self.max_entry_bytes == 0 {
+            u64::MAX
+        } else {
+            self.max_entry_bytes
+        };
+        let by_total = if self.max_total_uncompressed == 0 {
+            u64::MAX
+        } else {
+            let left = self.max_total_uncompressed.saturating_sub(already);
+            if left == 0 {
+                return Err(limit_err(format!(
+                    "archive decompresses beyond MAX_TOTAL_UNCOMPRESSED_BYTES ({})",
+                    self.max_total_uncompressed
+                )));
+            }
+            left
+        };
+        Ok(by_entry.min(by_total))
+    }
+
+    /// Rejects an entry by its declared sizes before anything is allocated.
+    fn check_declared(&self, name: &str, size: u64, compressed: Option<u64>, cap: u64) -> Result<()> {
+        if size > cap {
+            return Err(limit_err(format!(
+                "entry '{name}' declares {size} bytes, above the {cap}-byte limit"
+            )));
+        }
+        if self.max_ratio > 0 {
+            if let Some(compressed) = compressed.filter(|c| *c > 0) {
+                let ratio = size / compressed;
+                if ratio > self.max_ratio {
+                    return Err(limit_err(format!(
+                        "entry '{name}' expands {ratio}x ({size}/{compressed}), \
+                         above MAX_COMPRESSION_RATIO ({})",
+                        self.max_ratio
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Marker error for a cap violation. Unlike a corrupt/undecodable entry (which
+/// is skipped and reported per-entry, spec §2 "never abort"), this means the
+/// archive is hostile: the whole job aborts.
+#[derive(Debug)]
+pub struct LimitExceeded {
+    pub what: String,
+}
+
+impl std::fmt::Display for LimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.what)
+    }
+}
+
+impl std::error::Error for LimitExceeded {}
+
+fn limit_err(what: String) -> anyhow::Error {
+    anyhow::Error::new(LimitExceeded { what })
+}
+
+/// True when the error is a resource-cap violation (job must abort) rather
+/// than a per-entry read failure (entry is skipped).
+pub fn is_limit_exceeded(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<LimitExceeded>().is_some()
+}
+
+/// Reads at most `cap` bytes into `out`; a payload that keeps coming past the
+/// cap is reported instead of being buffered (a lying header cannot make us
+/// allocate unbounded memory).
+fn read_capped<R: Read>(reader: R, cap: u64, what: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let taken = reader
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| anyhow!("cannot read {what}: {e}"))?;
+    if taken as u64 > cap {
+        return Err(limit_err(format!(
+            "{what} exceeds the {cap}-byte limit (continues past the cap)"
+        )));
+    }
+    Ok(out)
+}
+
 fn read_entry_bytes<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     idx: usize,
+    limits: &ArchiveLimits,
+    already_decompressed: u64,
 ) -> Result<Vec<u8>> {
+    let cap = limits.entry_read_cap(already_decompressed)?;
+
     // First pass: the zip crate's own decoder. `entry` must be dropped before
     // we may touch `archive` again (ZipFile borrows it mutably).
-    let (expected_crc, expected_size, method, first_err) = {
+    let (expected_crc, expected_size, method, compressed_size, first_err) = {
         let mut entry = archive
             .by_index(idx)
             .map_err(|e| anyhow!("cannot open ZIP entry #{idx}: {e}"))?;
+        let declared_name = entry.name().to_string();
         let expected_crc = entry.crc32();
         let expected_size = entry.size();
+        let compressed_size = entry.compressed_size();
         let method = entry.compression();
+        limits.check_declared(&declared_name, expected_size, Some(compressed_size), cap)?;
         let mut bytes = Vec::new();
-        match entry.read_to_end(&mut bytes) {
-            Ok(_) => return Ok(bytes),
-            Err(e) => (expected_crc, expected_size, method, e),
+        match (&mut entry).take(cap.saturating_add(1)).read_to_end(&mut bytes) {
+            Ok(n) if n as u64 <= cap => return Ok(bytes),
+            // The header lied (or the cap is tiny): never keep buffering.
+            Ok(_) => {
+                return Err(limit_err(format!(
+                    "entry '{declared_name}' exceeds the {cap}-byte limit"
+                )))
+            }
+            Err(e) => (expected_crc, expected_size, method, compressed_size, e),
         }
     };
 
     // Entry whose in-crate decode failed: re-read the compressed payload raw
     // and retry with an independent decoder, accepting only a decode whose
-    // CRC32 and size match the entry's stored metadata.
-    let mut raw = Vec::new();
-    archive
-        .by_index_raw(idx)
-        .map_err(|e| anyhow!("cannot re-open ZIP entry #{idx}: {e}"))?
-        .read_to_end(&mut raw)
-        .map_err(|e| anyhow!("cannot re-read ZIP entry #{idx}: {e}"))?;
+    // CRC32 and size match the entry's stored metadata. Only attempted when
+    // the compressed payload itself is within budget — otherwise the raw
+    // re-read would be the very buffer we are trying to bound.
+    if compressed_size > cap {
+        return Err(anyhow!(
+            "cannot read ZIP entry #{idx} ({} method): {first_err}",
+            method_name(method)
+        ));
+    }
+    let raw = read_capped(
+        archive
+            .by_index_raw(idx)
+            .map_err(|e| anyhow!("cannot re-open ZIP entry #{idx}: {e}"))?,
+        cap,
+        &format!("ZIP entry #{idx} raw payload"),
+    )?;
     if let Some(out) = decode_fallback_verify(method, &raw, expected_crc, expected_size) {
         tracing::warn!(
             "ZIP entry #{idx}: {} decoder failed ({first_err}); recovered with independent decoder ({})",
@@ -1253,6 +1521,70 @@ fn output_stem(input_name: &str) -> String {
 
 /// Sanitizes a file name to a safe `[A-Za-z0-9._-]` token (used for stored
 /// outputs and spooled uploads under DATA_DIR).
+/// Decodes an image with explicit `image::Limits`. A crafted header can
+/// declare enormous dimensions (or an allocation far larger than the payload),
+/// and the decoder would otherwise try to honour it — the classic image
+/// decompression bomb. A `0` knob means "no limit" for that bound; the
+/// allocation bound defaults to whatever the crate itself uses.
+fn decode_with_limits(
+    bytes: &[u8],
+    cfg: &crate::config::Config,
+) -> image::ImageResult<image::DynamicImage> {
+    let mut limits = image::io::Limits::default();
+    if cfg.max_image_width > 0 {
+        limits.max_image_width = Some(cfg.max_image_width);
+    }
+    if cfg.max_image_height > 0 {
+        limits.max_image_height = Some(cfg.max_image_height);
+    }
+    if cfg.max_image_alloc_bytes > 0 {
+        limits.max_alloc = Some(cfg.max_image_alloc_bytes);
+    }
+    let mut reader = image::io::Reader::new(Cursor::new(bytes)).with_guessed_format()?;
+    reader.limits(limits);
+    reader.decode()
+}
+
+/// Removes a temporary file or directory tree when dropped, so a failed job,
+/// an early `?`, a client disconnect or a panic can never leak the spooled
+/// upload / the `.7z`-`.rar` extraction scratch under `DATA_DIR` (retention
+/// only prunes `*_elaborato.zip`, so a leaked spool accumulates forever).
+#[derive(Debug)]
+pub struct CleanupPath {
+    path: std::path::PathBuf,
+    is_dir: bool,
+}
+
+impl CleanupPath {
+    pub fn file(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            is_dir: false,
+        }
+    }
+
+    pub fn dir(path: std::path::PathBuf) -> Self {
+        Self { path, is_dir: true }
+    }
+}
+
+impl Drop for CleanupPath {
+    fn drop(&mut self) {
+        let result = if self.is_dir {
+            std::fs::remove_dir_all(&self.path)
+        } else {
+            std::fs::remove_file(&self.path)
+        };
+        if let Err(e) = result {
+            // Already gone (or never created) is the normal case on the happy
+            // path; anything else deserves a line in the log.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("cannot clean up {}: {e}", self.path.display());
+            }
+        }
+    }
+}
+
 pub fn sanitize_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -1315,7 +1647,7 @@ fn process_one_image(
     };
 
     let t0 = std::time::Instant::now();
-    let decoded = match image::load_from_memory(&bytes) {
+    let decoded = match decode_with_limits(&bytes, cfg) {
         Ok(img) => img,
         Err(e) => {
             errors.fetch_add(1, Ordering::Relaxed);
@@ -1471,19 +1803,16 @@ mod tests {
     use futures_util::StreamExt;
     use image::GenericImageView;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicUsize;
     use tokio_util::io::ReaderStream;
 
-    static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_temp_dir(tag: &str) -> PathBuf {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "av_zip_worker_test_{tag}_{}_{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Unique per run and removed on drop; see `crate::testutil`.
+    ///
+    /// A test that opens a `Db` inside the directory must call
+    /// `db.close().await` before its end: only that releases the SQLite file
+    /// (and with it the directory, which Windows cannot delete while the
+    /// handle is open).
+    fn test_temp_dir(tag: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("zip_worker_test_{tag}"))
     }
 
     fn test_cfg(data_dir: &Path) -> Config {
@@ -1560,6 +1889,147 @@ mod tests {
         (0..archive.len())
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect()
+    }
+
+    #[test]
+    fn archive_limits_reject_oversized_and_bombing_entries() {
+        let limits = ArchiveLimits {
+            max_entries: 10,
+            max_entry_bytes: 1024,
+            max_total_uncompressed: 4096,
+            max_ratio: 200,
+        };
+        // Per-entry cap bounds the read budget (here further limited by the
+        // archive-wide budget of 4096 bytes).
+        let cap = limits.entry_read_cap(0).unwrap();
+        assert_eq!(cap, 1024);
+        let err = limits
+            .check_declared("big.bin", 2048, Some(2048), cap)
+            .unwrap_err();
+        assert!(is_limit_exceeded(&err), "declared size above the cap must abort");
+        // Archive-wide budget: the per-entry cap still wins while budget is
+        // left, then the budget is exhausted.
+        assert_eq!(limits.entry_read_cap(1024).unwrap(), 1024);
+        assert_eq!(limits.entry_read_cap(3584).unwrap(), 512);
+        assert!(is_limit_exceeded(&limits.entry_read_cap(4096).unwrap_err()));
+
+        // Per-entry cap only (no archive-wide squeeze), ratio cap active.
+        let limits = ArchiveLimits {
+            max_entries: 10,
+            max_entry_bytes: 10 * 1024 * 1024,
+            max_total_uncompressed: 0,
+            max_ratio: 500,
+        };
+        let cap = limits.entry_read_cap(0).unwrap();
+        // A "bomb": tiny compressed payload declaring megabytes.
+        let err = limits
+            .check_declared("bomb.bin", 8 * 1024 * 1024, Some(1024), cap)
+            .unwrap_err();
+        assert!(is_limit_exceeded(&err), "ratio above the cap must abort");
+        // Realistic JPEG: barely compressible, accepted.
+        assert!(limits
+            .check_declared("CAM_001/foto.jpg", 200_000, Some(190_000), cap)
+            .is_ok());
+        // Highly redundant but legitimate scan-like entry: still accepted.
+        assert!(limits
+            .check_declared("CAM_001/scan.tif", 8 * 1024 * 1024, Some(32 * 1024), cap)
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_limits_disable_the_checks() {
+        let limits = ArchiveLimits {
+            max_entries: 0,
+            max_entry_bytes: 0,
+            max_total_uncompressed: 0,
+            max_ratio: 0,
+        };
+        assert_eq!(limits.entry_read_cap(0).unwrap(), u64::MAX);
+        assert!(limits.entry_read_cap(u64::MAX - 1).is_ok());
+        assert!(limits
+            .check_declared("anything", u64::MAX / 2, Some(1), u64::MAX)
+            .is_ok());
+    }
+
+    #[test]
+    fn real_deflate_bomb_is_rejected_by_the_ratio_cap() {
+        // 1 MiB of zeros compresses ~1000x: exactly the payload a zip-bomb
+        // relies on. Build it for real, then check the declared metadata the
+        // extractor sees.
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            w.start_file(
+                "CAM_001/bomb.bin",
+                zip::write::FileOptions::<()>::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            w.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+            w.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let entry = archive.by_index(0).unwrap();
+        let (declared, compressed) = (entry.size(), entry.compressed_size());
+        assert!(declared >= 1024 * 1024);
+        assert!(compressed * 50 < declared, "expected a >=50x ratio");
+
+        let strict = ArchiveLimits {
+            max_entries: 100,
+            max_entry_bytes: 512 * 1024 * 1024,
+            max_total_uncompressed: 1024 * 1024 * 1024,
+            max_ratio: 50,
+        };
+        let cap = strict.entry_read_cap(0).unwrap();
+        assert!(is_limit_exceeded(
+            &strict
+                .check_declared("CAM_001/bomb.bin", declared, Some(compressed), cap)
+                .unwrap_err()
+        ));
+
+        // The shipped default (500) also rejects it, while a realistic
+        // image ratio (~1.05x) sails through: only amplification trips the cap.
+        let default = ArchiveLimits::test_default();
+        assert_eq!(default.max_ratio, 500);
+        let cap = default.entry_read_cap(0).unwrap();
+        assert!(is_limit_exceeded(
+            &default
+                .check_declared("CAM_001/bomb.bin", declared, Some(compressed), cap)
+                .unwrap_err()
+        ));
+        assert!(default
+            .check_declared("CAM_001/foto.jpg", 200_000, Some(190_000), cap)
+            .is_ok());
+    }
+
+    #[test]
+    fn read_capped_refuses_a_payload_that_keeps_coming() {
+        let data = vec![7u8; 100];
+        assert_eq!(read_capped(Cursor::new(&data), 100, "payload").unwrap().len(), 100);
+        let err = read_capped(Cursor::new(&data), 99, "payload").unwrap_err();
+        assert!(is_limit_exceeded(&err), "a past-the-cap read must abort");
+        // A cap of 0 means "unlimited" (mirrors MAX_* = 0).
+        assert_eq!(
+            read_capped(Cursor::new(&data), u64::MAX, "payload").unwrap().len(),
+            100
+        );
+    }
+
+    #[test]
+    fn entry_count_cap_is_enforced() {
+        let limits = ArchiveLimits {
+            max_entries: 3,
+            ..ArchiveLimits::test_default()
+        };
+        assert!(limits.check_entry_count(3).is_ok());
+        let err = limits.check_entry_count(4).unwrap_err();
+        assert!(is_limit_exceeded(&err));
+        let unlimited = ArchiveLimits {
+            max_entries: 0,
+            ..ArchiveLimits::test_default()
+        };
+        assert!(unlimited.check_entry_count(usize::MAX).is_ok());
     }
 
     #[test]
@@ -1672,16 +2142,24 @@ mod tests {
             b"The large entry exercises the liblzma buffer-growth path: this sentence repeats. "
                 .repeat(5000), // 405 KB: must grow past the initial 64 KiB buffer
         ];
+        // The text entries below deflate far above the shipped ratio cap (a
+        // 405 KB entry from 216 bytes = 1875x). In the pipeline they are never
+        // read (only camera-layout *images* are), so this helper-level test
+        // disables the ratio check to isolate the decoder behaviour.
+        let limits = ArchiveLimits {
+            max_ratio: 0,
+            ..ArchiveLimits::test_default()
+        };
         for (idx, want) in expected.iter().enumerate() {
             assert_eq!(
-                read_entry_bytes(&mut archive, idx).unwrap(),
+                read_entry_bytes(&mut archive, idx, &limits, 0).unwrap(),
                 *want,
                 "liblzma fallback decoded entry #{idx} incorrectly"
             );
         }
         // Non-LZMA entries still take the plain path.
         assert_eq!(
-            read_entry_bytes(&mut archive, 4).unwrap(),
+            read_entry_bytes(&mut archive, 4, &limits, 0).unwrap(),
             expected[1][..100]
         );
     }
@@ -1694,6 +2172,32 @@ mod tests {
         assert_eq!(error_file_name("Mio_Test.zip"), "Mio_Test_error.txt");
         assert_eq!(error_file_name("a/b/lotto1.ZIP"), "lotto1_error.txt");
         assert_eq!(error_file_name("nofile"), "nofile_error.txt");
+    }
+
+    /// The RAII guards are what keep spooled uploads and extraction scratch
+    /// from leaking when a job bails early (or panics).
+    #[test]
+    fn cleanup_guard_removes_files_and_dirs() {
+        let root = crate::testutil::TempDir::new("cleanup_guard");
+
+        let file = root.join("spool.in");
+        std::fs::write(&file, b"payload").unwrap();
+        {
+            let _guard = CleanupPath::file(file.clone());
+            assert!(file.exists());
+        }
+        assert!(!file.exists(), "file guard must remove on drop");
+
+        let scratch = root.join("tmp_7z_x");
+        std::fs::create_dir_all(scratch.join("nested")).unwrap();
+        {
+            let _guard = CleanupPath::dir(scratch.clone());
+            assert!(scratch.exists());
+        }
+        assert!(!scratch.exists(), "dir guard must remove the tree on drop");
+
+        // Dropping a guard for a path that never existed must not panic.
+        drop(CleanupPath::file(root.join("missing.in")));
     }
 
     #[test]
@@ -1777,7 +2281,7 @@ mod tests {
         let dir = test_temp_dir("merge");
         let cfg = test_cfg(&dir);
         let db = Db::open(&dir.join("t.sqlite3")).await.unwrap();
-        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db.clone(), store_without_models());
 
         let zip1 = dir.join("a.zip");
         let zip2 = dir.join("b.zip");
@@ -1825,6 +2329,7 @@ mod tests {
                 .is_err(),
             "no batch_error.txt expected when nothing failed"
         );
+        db.close().await;
     }
 
     #[tokio::test]
@@ -1836,7 +2341,7 @@ mod tests {
         let dir = test_temp_dir("merge_dup");
         let cfg = test_cfg(&dir);
         let db = Db::open(&dir.join("t.sqlite3")).await.unwrap();
-        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db.clone(), store_without_models());
 
         let zip1 = dir.join("lotto1.zip");
         write_zip(
@@ -1853,6 +2358,7 @@ mod tests {
         assert_eq!(names.len(), 2, "duplicates must be dropped: {names:?}");
         assert!(names.contains(&"CAM_001/x.jpg".to_string()));
         assert!(names.contains(&"CAM_002/y.png".to_string()));
+        db.close().await;
     }
 
     #[tokio::test]
@@ -1881,7 +2387,7 @@ mod tests {
         let spool = dir.join("upload_20260101_test.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
 
-        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db.clone(), store_without_models());
         let outcome = processor
             .process_archive_file("test.zip", &spool)
             .await
@@ -1951,6 +2457,7 @@ mod tests {
         // only the output + sqlite + ledger artifacts.
         std::fs::remove_file(&spool).unwrap();
         assert!(!spool.exists());
+        db.close().await;
     }
 
     #[tokio::test]
@@ -1966,7 +2473,7 @@ mod tests {
         let spool = dir.join("upload_x.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
 
-        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db.clone(), store_without_models());
         let outcome = processor
             .process_archive_file("x.zip", &spool)
             .await
@@ -1982,6 +2489,7 @@ mod tests {
         let names = zip_entry_names(&std::fs::read(&outcome.output_path).unwrap());
         assert!(names.contains(&"CAM_001/frame1.jpg".to_string()));
         assert!(names.contains(&"x_error.txt".to_string()));
+        db.close().await;
     }
 
     #[tokio::test]
@@ -2004,7 +2512,7 @@ mod tests {
         ]);
         let spool = dir.join("up.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
-        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db.clone(), store_without_models());
         let outcome = processor
             .process_archive_file("up.zip", &spool)
             .await
@@ -2043,7 +2551,7 @@ mod tests {
         let zip2 = build_zip(&[("CAM_001/a.jpg", jpeg.as_slice())]);
         let spool2 = dir2.join("up.zip");
         std::fs::write(&spool2, &zip2).unwrap();
-        let p2 = ZipProcessor::new(RuntimeConfig::fixed(cfg2.clone()), db2, store_without_models());
+        let p2 = ZipProcessor::new(RuntimeConfig::fixed(cfg2.clone()), db2.clone(), store_without_models());
         let out2 = p2
             .process_archive_file("up.zip", &spool2)
             .await
@@ -2057,6 +2565,8 @@ mod tests {
             !names2.iter().any(|n| n == "CAM_001/a.jpg"),
             "old jpg name must be gone: {names2:?}"
         );
+        db.close().await;
+        db2.close().await;
     }
 
     #[tokio::test]
@@ -2071,7 +2581,7 @@ mod tests {
         let zip_bytes = build_zip(&[("CAM_001/frame1.jpg", jpeg.as_slice())]);
         let spool = dir.join("up.zip");
         std::fs::write(&spool, &zip_bytes).unwrap();
-        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db, store_without_models());
+        let processor = ZipProcessor::new(RuntimeConfig::fixed(cfg.clone()), db.clone(), store_without_models());
         let outcome = processor
             .process_archive_file("up.zip", &spool)
             .await
@@ -2093,5 +2603,6 @@ mod tests {
             (16, 10),
             "48x32 downscaled to max side 16 keeps the aspect ratio"
         );
+        db.close().await;
     }
 }
