@@ -1,9 +1,5 @@
 # Anonimizzazione Volti — batch face-anonymization service (Rust + ONNX)
 
-<p align="center">
-  <img src="docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
-</p>
-
 Industrial-grade microservice that anonymizes (blurs) faces in batches of images
 captured by fixed traffic/ZTL cameras, targeting GDPR compliance: **zero
 visibly-unblurred real faces in the output**, surgical precision via a binary
@@ -28,10 +24,6 @@ artifact and is no longer shipped with the repository.
 | `src/training.rs` + `python/retrain.py` | Optional nightly PyO3 retraining bridge: fine-tune + ONNX export + pre-swap validation + backup + JSON audit |
 | `src/eval_wider.rs` / `src/eval_fddb.rs` | Offline CLI evaluation of the detector against WIDER FACE / FDDB ground truth (AP, precision/recall, recall vs FP-per-image) |
 | `python/prepare_seed.py` | Classifier-seed builder: crops face boxes from a YOLO dataset or from WIDER FACE (difficulty-filtered) |
-
-### Workflow
-
-![Flusso di lavoro: ingest dell'archivio, FSM per camera, pipeline di blur e output anonimizzato con ledger dei job](docs/images/flusso-di-lavoro-anonimizzazione-visi.jpg)
 
 ### Session model (important)
 

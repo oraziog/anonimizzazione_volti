@@ -1,18 +1,9 @@
 # Anonimizzazione Volti
 
-<p align="center">
-  <img src="src/docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
-</p>
-
 Servizio batch di anonimizzazione facciale (Rust + ONNX) per telecamere fisse
 ZTL/traffico, orientato alla conformità GDPR: **zero volti reali visibilmente
 non offuscati in uscita**, precisione chirurgica tramite classificatore binario
 e apprendimento automatico del ROI per telecamera.
-
-<p align="center">
-  <img src="src/docs/images/flusso-di-lavoro-anonimizzazione-visi.jpg"
-       alt="Flusso di lavoro: ingest dell'archivio, FSM per camera, pipeline di blur e output anonimizzato">
-</p>
 
 Il design rationale è espresso nei sorgenti come commenti `spec §N`; il
 documento di specifica associato era un artefatto di start-up e non è più
@@ -91,19 +82,10 @@ dell'uso in produzione). `dataset_falsi_positivi/`, `dataset_seed/`,
 
 # Anonimizzazione Volti — README (English)
 
-<p align="center">
-  <img src="src/docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
-</p>
-
 Batch face-anonymization service (Rust + ONNX) for fixed traffic/ZTL cameras,
 designed for GDPR compliance: **zero visibly-unblurred real faces in the
 output**, surgical precision via a binary classifier, and automatic per-camera
 region-of-interest (ROI) learning.
-
-<p align="center">
-  <img src="src/docs/images/flusso-di-lavoro-anonimizzazione-visi.jpg"
-       alt="Workflow: archive ingest, per-camera FSM, blur pipeline and anonymized output">
-</p>
 
 Design rationale is captured throughout the source as `spec §N` comments;
 the original specification document was an internal startup artifact and is no
