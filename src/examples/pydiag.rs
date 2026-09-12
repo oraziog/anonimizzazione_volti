@@ -1,10 +1,11 @@
 // Diagnostica PyO3: replica l'ordine di import di retrain.py (torch prima,
 // poi onnx/onnxscript) e prova la cure add_dll_directory per onnx.
-// Solo con la feature `retraining` (richiede pyo3); cargo salta questo
-// file quando la feature è spenta.
-#![cfg(feature = "retraining")]
+// Utile solo con la feature `retraining` (richiede pyo3); senza feature
+// stampa solo un avviso, così `cargo test` compila sempre gli examples.
+#[cfg(feature = "retraining")]
 use pyo3::prelude::*;
 
+#[cfg(feature = "retraining")]
 fn try_import(py: Python, name: &str) {
     match py.import(name) {
         Ok(m) => {
@@ -21,6 +22,7 @@ fn try_import(py: Python, name: &str) {
     }
 }
 
+#[cfg(feature = "retraining")]
 const CURE: &str = r#"
 import os, sys
 sp = [p for p in sys.path if 'site-packages' in p][0]
@@ -31,6 +33,7 @@ for sub in ('onnx', 'onnxscript', 'onnx_ir', 'onnxruntime', 'google/protobuf'):
         print('dll-dir registered:', d)
 "#;
 
+#[cfg(feature = "retraining")]
 fn main() {
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
@@ -45,4 +48,9 @@ fn main() {
         try_import(py, "onnx");
         try_import(py, "onnxscript");
     });
+}
+
+#[cfg(not(feature = "retraining"))]
+fn main() {
+    println!("pydiag richiede la feature 'retraining': ricompila con --features retraining");
 }
