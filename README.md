@@ -4,6 +4,12 @@
   <img src="src/docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
 </p>
 
+<p align="center">
+  <a href="https://github.com/oraziog/anonimizzazione_volti/actions/workflows/ci.yml"><img src="https://github.com/oraziog/anonimizzazione_volti/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <img src="https://img.shields.io/badge/linguaggio-Rust-orange?logo=rust" alt="Rust">
+  <a href="INSTALLAZIONE.md"><img src="https://img.shields.io/badge/docs-INSTALLAZIONE.md-blue" alt="Manuale di installazione"></a>
+</p>
+
 Servizio batch di anonimizzazione facciale (Rust + ONNX) per telecamere fisse
 ZTL/traffico, orientato alla conformità GDPR: **zero volti reali visibilmente
 non offuscati in uscita**, precisione chirurgica tramite classificatore binario
@@ -134,6 +140,12 @@ dell'uso in produzione). `dataset_falsi_positivi/`, `dataset_seed/`,
 
 <p align="center">
   <img src="src/docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
+</p>
+
+<p align="center">
+  <a href="https://github.com/oraziog/anonimizzazione_volti/actions/workflows/ci.yml"><img src="https://github.com/oraziog/anonimizzazione_volti/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <img src="https://img.shields.io/badge/language-Rust-orange?logo=rust" alt="Rust">
+  <a href="INSTALLATION.md"><img src="https://img.shields.io/badge/docs-INSTALLATION.md-blue" alt="Installation manual"></a>
 </p>
 
 Batch face-anonymization service (Rust + ONNX) for fixed traffic/ZTL cameras,
