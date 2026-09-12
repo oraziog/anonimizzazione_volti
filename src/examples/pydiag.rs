@@ -1,5 +1,8 @@
 // Diagnostica PyO3: replica l'ordine di import di retrain.py (torch prima,
 // poi onnx/onnxscript) e prova la cure add_dll_directory per onnx.
+// Solo con la feature `retraining` (richiede pyo3); cargo salta questo
+// file quando la feature è spenta.
+#![cfg(feature = "retraining")]
 use pyo3::prelude::*;
 
 fn try_import(py: Python, name: &str) {
