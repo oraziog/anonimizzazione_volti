@@ -154,6 +154,12 @@ pub struct Config {
     pub anon_mode: AnonMode,
     pub pixelate_cell_px: u32,
 
+    /// Camera identity source for archive ingestion (env `CAMERA_ID_SOURCE`,
+    /// default `filename`): `exif` prefers the body serial number written by
+    /// the camera into each frame's EXIF (`exif_camera.rs`) and falls back to
+    /// the filename/folder identity when no usable serial is present.
+    pub camera_id_source: CameraIdSource,
+
     pub learning_days: u32,
     pub roi_eps_px: f32,
     pub roi_min_samples: u32,
@@ -515,6 +521,28 @@ impl OutputFormat {
     }
 }
 
+/// Camera identity source for archive ingestion (env `CAMERA_ID_SOURCE`):
+/// `filename` (default) keeps the historical archive-layout mapping
+/// (`CAM_001/foto.jpg` → camera `CAM_001`); `exif` prefers the body serial
+/// number stored in each frame — unique per physical camera, immune to file
+/// renames and archive merges — and falls back to the filename identity
+/// whenever the frame carries no usable serial (never rejects a frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraIdSource {
+    Filename,
+    Exif,
+}
+
+impl CameraIdSource {
+    fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "filename" | "file" | "name" => Ok(CameraIdSource::Filename),
+            "exif" | "serial" => Ok(CameraIdSource::Exif),
+            other => anyhow::bail!("CAMERA_ID_SOURCE '{other}' must be 'filename' or 'exif'"),
+        }
+    }
+}
+
 /// Parses `OUTPUT_MAX_SIDE`: 0 (off) or a larger side ≥ 128 px (downscaling an
 /// output below ~64 px corrupts the anonymized face region meaninglessly).
 fn parse_output_max_side() -> Result<u32> {
@@ -716,6 +744,7 @@ impl Config {
             classifier_enforce: env_parse::<bool>("CLASSIFIER_ENFORCE", true)?,
             anon_mode: AnonMode::parse(&env_str("ANON_MODE", "blur"))?,
             pixelate_cell_px: env_parse::<u32>("PIXELATE_CELL_PX", 12)?.clamp(2, 128),
+            camera_id_source: CameraIdSource::parse(&env_str("CAMERA_ID_SOURCE", "filename"))?,
 
             learning_days: env_parse::<u32>("LEARNING_DAYS", 30)?.max(1),
             roi_eps_px: env_parse::<f32>("ROI_EPS_PX", 50.0)?.max(1.0),
@@ -1286,6 +1315,7 @@ impl Config {
             classifier_enforce: true,
             anon_mode: AnonMode::Blur,
             pixelate_cell_px: 12,
+            camera_id_source: CameraIdSource::Filename,
             learning_days: 30,
             roi_eps_px: 50.0,
             roi_min_samples: 15,

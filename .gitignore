@@ -1,10 +1,40 @@
 # Rust build
 /target
-/Cargo.lock
-Cargo.lock.bak
+/Cargo.lock.bak
 
-# Generated sample outputs (anonymized demo images — never commit)
-src/docs/images/sample_outputs/
+# Runtime data (database, output elaborati, audit, configurazione runtime)
+/data/
 
-# Staging folder for README images (source copies live in src/docs/images)
-New folder/
+# Log del servizio e report/alert generati
+/logs/
+/reports/
+/alerts/
+
+# Modelli ONNX scaricati a runtime e candidati del retraining
+/models/
+
+# Dataset (seed volti reali e falsi positivi raccolti dal servizio)
+# NOTA: il seed NON e' generato dal sistema; vedi README "Licenza dei dati".
+/dataset_falsi_positivi/
+/dataset_seed/
+
+# Archivi di test e immagini di verifica (MAI committare foto/filmati reali)
+/test_zip/
+/test_input.zip
+/wider_seed/
+/test-assets/
+
+# Log di build e test locali
+/build.log
+/test.log
+
+# Ambiente locale (contiene segreti: chiave operatore, credenziali)
+.env
+src/.env
+
+# Directory venv Python locale (retraining)
+/.venv312/
+
+# File di sistema
+.DS_Store
+Thumbs.db

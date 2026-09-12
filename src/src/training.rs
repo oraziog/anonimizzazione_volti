@@ -528,7 +528,7 @@ mod tests {
     fn classifier_state_roundtrip() {
         let dir = test_dir("state");
         let mut cfg = crate::config::Config::test_default();
-        cfg.data_dir = dir.clone();
+        cfg.data_dir = dir.to_path_buf();
         write_classifier_state(&cfg, Path::new("/tmp/classifier_x.onnx"), 0.912).unwrap();
         let st = read_classifier_state(&cfg).unwrap();
         assert_eq!(st.active_onnx, "/tmp/classifier_x.onnx");

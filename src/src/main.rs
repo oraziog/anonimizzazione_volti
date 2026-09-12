@@ -27,6 +27,7 @@ mod config;
 mod db;
 mod eval_fddb;
 mod eval_wider;
+mod exif_camera;
 mod model_loader;
 mod models;
 mod pipeline;
@@ -267,11 +268,49 @@ async fn run() -> Result<()> {
             Some(SessionPool::new(resolved.path, cfg.effective_concurrency()))
         }
         None => {
-            tracing::warn!(
-                "no initial classifier configured — ACTIVE cameras will blur every \
-                 in-ROI detection until the first successful nightly retraining"
-            );
-            None
+            // No CLASSIFIER_MODEL_URL configured: restore the last classifier
+            // swapped by the nightly retraining from `classifier_state.json`.
+            // The swap path validates the ONNX with `ort` before persisting,
+            // so the restored file is known-loadable (re-checked defensively).
+            #[cfg(feature = "retraining")]
+            let restored = crate::training::read_classifier_state(&cfg).and_then(|st| {
+                let p = PathBuf::from(&st.active_onnx);
+                if !p.exists() {
+                    tracing::warn!(
+                        "persisted classifier {} no longer exists; ignoring",
+                        p.display()
+                    );
+                    return None;
+                }
+                match model_loader::load_session(&p) {
+                    Ok(_) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(
+                            "persisted classifier {} not loadable: {e:#}; ignoring",
+                            p.display()
+                        );
+                        None
+                    }
+                }
+            });
+            #[cfg(not(feature = "retraining"))]
+            let restored: Option<PathBuf> = None;
+            match restored {
+                Some(p) => {
+                    tracing::info!(
+                        "classifier restored from persisted state: {} (no CLASSIFIER_MODEL_URL configured)",
+                        p.display()
+                    );
+                    Some(SessionPool::new(p, cfg.effective_concurrency()))
+                }
+                None => {
+                    tracing::warn!(
+                        "no initial classifier configured — ACTIVE cameras will blur every \
+                         in-ROI detection until the first successful nightly retraining"
+                    );
+                    None
+                }
+            }
         }
     };
 

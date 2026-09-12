@@ -46,6 +46,10 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# EXIF metadata reader (pure Rust): with CAMERA_ID_SOURCE=exif the ingest path
+# derives the camera id from the body serial number (tag 0xA431) instead of
+# the filename/folder prefix, falling back to the layout when absent.
+exif = { package = "kamadak-exif", version = "0.6" }
 futures-util = "0.3"
 
 pyo3 = { version = "0.21", features = ["auto-initialize"], optional = true }

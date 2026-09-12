@@ -17,8 +17,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::Semaphore;
 
-use crate::config::{Config, RuntimeConfig};
+use crate::config::{CameraIdSource, Config, RuntimeConfig};
 use crate::db::{Camera, CameraState, Db, Detection};
+use crate::exif_camera::exif_camera_id;
 use crate::models::ModelStore;
 use crate::pipeline::{process_image, Branch};
 
@@ -320,15 +321,41 @@ impl ZipProcessor {
     /// Resolves a camera row once per camera id per job: the first image of a
     /// camera queries/creates the row, all subsequent frames reuse the cached
     /// snapshot. Saves one sqlite roundtrip (and a transaction) per frame.
+    ///
+    /// With `CAMERA_ID_SOURCE=exif` the identity comes from the frame's body
+    /// serial number (see `exif_camera.rs`) and falls back to the filename/
+    /// folder identity when the frame carries no usable serial — a missing
+    /// EXIF tag never rejects a frame. The cache is keyed by the *resolved*
+    /// id, so both identities map onto the same row within a job.
     async fn camera_for(
         &self,
         cache: &mut HashMap<String, Camera>,
-        id: &str,
+        filename_id: &str,
+        bytes: &[u8],
     ) -> Result<Camera> {
-        if let Some(cam) = cache.get(id) {
+        let id = match self.cfg.snapshot().camera_id_source {
+            CameraIdSource::Filename => filename_id.to_string(),
+            CameraIdSource::Exif => match exif_camera_id(bytes) {
+                Some(serial) => {
+                    if serial != filename_id {
+                        tracing::info!(
+                            "camera id from EXIF serial '{serial}' (filename identity '{filename_id}')"
+                        );
+                    }
+                    serial
+                }
+                None => {
+                    tracing::debug!(
+                        "no usable EXIF serial in '{filename_id}'; camera id from filename"
+                    );
+                    filename_id.to_string()
+                }
+            },
+        };
+        if let Some(cam) = cache.get(&id) {
             return Ok(cam.clone());
         }
-        let cam = self.db.get_or_create_camera(id).await?;
+        let cam = self.db.get_or_create_camera(&id).await?;
         cache.insert(id.to_string(), cam.clone());
         Ok(cam)
     }
@@ -452,7 +479,7 @@ impl ZipProcessor {
             decompressed += bytes.len() as u64;
 
             // Camera FSM bookkeeping lives on the async side (sqlx).
-            let cam = match self.camera_for(&mut cam_cache, &target.camera_id).await {
+            let cam = match self.camera_for(&mut cam_cache, &target.camera_id, &bytes).await {
                 Ok(c) => c,
                 Err(e) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
@@ -818,7 +845,7 @@ impl ZipProcessor {
                 }
             };
 
-            let cam = match self.camera_for(&mut cam_cache, &target.camera_id).await {
+            let cam = match self.camera_for(&mut cam_cache, &target.camera_id, &bytes).await {
                 Ok(c) => c,
                 Err(e) => {
                     self.errors.fetch_add(1, Ordering::Relaxed);
@@ -1615,6 +1642,11 @@ fn error_file_name(input_name: &str) -> String {
     }
 }
 
+/// Process-global counter for false-positive crop filenames: guarantees a
+/// unique `{job_stamp}_{seq:06}.jpg` even when many images of the same job
+/// (same `job_stamp`) save crops concurrently.
+static FP_CROP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Blocking per-image worker: decode → FSM-conditional anonymization → encode.
 ///
 /// Never panics: every failure is logged and counted; a processing error
@@ -1699,11 +1731,15 @@ fn process_one_image(
 
     // Persist false-positive crops for retraining (§4):
     // /app/dataset_falsi_positivi/{camera_id}/{job_stamp}_{seq}.jpg
+    // `seq` is process-global (AtomicUsize): all images of one job share the
+    // same `job_stamp` and images run concurrently, so a per-image index would
+    // make later images silently overwrite earlier crops.
     if !fp_crops.is_empty() {
         let dir = cfg.dataset_fp_dir.join(&job.camera_id);
         if std::fs::create_dir_all(&dir).is_ok() {
-            for (i, (_cx, _cy, crop)) in fp_crops.into_iter().enumerate() {
-                let path = dir.join(format!("{job_stamp}_{i:04}.jpg"));
+            for (_cx, _cy, crop) in fp_crops.into_iter() {
+                let seq = FP_CROP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let path = dir.join(format!("{job_stamp}_{seq:06}.jpg"));
                 if crop.save(&path).is_ok() {
                     outcome.fp_crops_saved += 1;
                 }

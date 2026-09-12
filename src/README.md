@@ -595,8 +595,12 @@ Key groups:
 - **Pipeline** — `YOLO_CONF_THRESHOLD`, `YOLO_NMS_IOU`,
   `FP_CROP_CONF_MAX`, `INITIAL_BLUR_SIGMA`, `BLUR_HULL_MARGIN_PCT`,
   `JPEG_QUALITY`, `SEGMENTER_MIN_BOX`, `OUTPUT_FORMAT`, `OUTPUT_MAX_SIDE`.
-- **FSM/ROI** — `LEARNING_DAYS`, `ROI_EPS_PX`, `ROI_MIN_SAMPLES`,
+- **FSM/ROI** — `LEARNING_DAYS`, `CAMERA_ID_SOURCE`, `ROI_EPS_PX`, `ROI_MIN_SAMPLES`,
   `ROI_RDP_EPSILON`, `ROI_AREA_MIN`, `ROI_AREA_MAX`, `ROI_MARGIN_PCT`.
+  `CAMERA_ID_SOURCE=exif` derives the camera identity from the frame's EXIF
+  body serial number (tag `BodySerialNumber`) instead of the archive layout,
+  falling back to the filename/folder identity when no usable serial is
+  present; the default `filename` keeps the historical mapping.
   **Dynamic ROI (ACTIVE)**: ogni passaggio notturno ri-estrae il poligono
   dalle rilevazioni anonimizzate degli ultimi `ROI_REEXTRACT_WINDOW_DAYS` e
   lo sostituisce solo se è diverso da quello attivo oltre `ROI_REEXTRACT_MIN_IOU`

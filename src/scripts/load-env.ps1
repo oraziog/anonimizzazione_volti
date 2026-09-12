@@ -6,6 +6,8 @@
 #
 # Uso (PowerShell, da qualsiasi posizione):
 #   . .\scripts\load-env.ps1                        # carica .\...\sunse
+#   (se .env non c'e' nella directory corrente, prova automaticamente
+#    il .env della cartella padre dello script, es. src\.env)
 #   . ".\scripts\load-env.ps1" -Path .\.env         # file esplicito
 #   . ".\scripts\load-env.ps1" -Path .\.env -Prefix APP_
 #   . ".\scripts\load-env.ps1" -Force               # sovrascrive le variabili
@@ -35,8 +37,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Fallback: se il percorso richiesto (default ".env" nella directory corrente)
+# non esiste, prova il .env della cartella padre dello script (src/), cosi'
+# lo script funziona anche lanciato da dentro scripts\ senza -Path ..\.env.
 if (-not (Test-Path -LiteralPath $Path)) {
-    throw "File .env non trovato: $Path"
+    $fallback = Join-Path $PSScriptRoot "..\.env"
+    if (Test-Path -LiteralPath $fallback) {
+        $Path = $fallback
+    } else {
+        throw "File .env non trovato: $Path"
+    }
 }
 
 $global:envLoad = @{}

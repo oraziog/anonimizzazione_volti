@@ -18,9 +18,14 @@ in `src/README.md`.
   sfocatura full-frame cautelativa, raccolta dati, estrazione **ROI** (DBSCAN →
   hull convesso), gate ROI + **classificatore binario** + maschera hull/ellisse
   dei 5 landmark facciali, fallback "head" per profili puri.
+- **Identità della camera** — dal **numero di serie EXIF** del frame
+  (`CAMERA_ID_SOURCE=exif`, tag BodySerialNumber) con fallback automatico
+  sull'identità ricavata dal nome file.
 - **Autoapprendimento notturno** — retraining PyO3 (MobileNetV2: seed + falsi
   positivi), export ONNX, validazione Rust-side, gate A/B, swap atomico con
-  backup, audit JSON consultabile dall'operatore.
+  backup, audit JSON consultabile dall'operatore; il modello swappato
+  **sopravvive ai riavvii** (ripristino automatico dallo stato persistito
+  all'avvio).
 - **Store S3** — backend di ingest asincrono da bucket S3-compatibili
   (MinIO / AWS / Spaces): job intake, output su bucket, audit log JSON,
   **webhook di completamento con URL presigned (1 h)**, sweep operator batch,
@@ -37,6 +42,41 @@ in `src/README.md`.
   (feature cargo + `Dockerfile.gpu`), fail-fast se la GPU configurata non è
   utilizzabile.
 
+## Documentazione
+
+| Documento | Contenuto |
+| --- | --- |
+| [`INSTALLAZIONE.md`](INSTALLAZIONE.md) | **Manuale di installazione e messa in servizio su Windows** — prerequisiti, build, configurazione, FSM delle cam, strumenti operativi e diario delle difficoltà reali con le soluzioni |
+| [`INSTALLATION.md`](INSTALLATION.md) | Versione inglese del manuale di installazione |
+| [`ATTIVA-RETRAINING.md`](ATTIVA-RETRAINING.md) | Stato del retraining notturno, diagnostica PyO3/ONNX e note Docker |
+| [`src/README.md`](src/README.md) | Riferimento operativo completo: architettura, API, configurazione, S3, code, tuning |
+
+## Avvio rapido (Windows nativo)
+
+Prerequisiti e build dettagliati in [INSTALLAZIONE.md](INSTALLAZIONE.md); in
+sintesi:
+
+```powershell
+# 1) build (dalla root del repo)
+cargo build --release --manifest-path src/Cargo.toml
+
+# 2) configurazione: copia src/.env.example in src/.env e personalizza
+#    (OPERATOR_API_KEY, percorsi, CRON_RETRAIN_SCHEDULE, ...)
+
+# 3) avvio con un doppio click: start-server.cmd (carica il .env, lancia
+#    l'exe, log su logs\server.log)
+
+# 4) verifica
+curl http://localhost:8080/health
+```
+
+Il primo avvio scarica i modelli ONNX (YOLO) in `models_cache/`; le cam
+partono in `INITIAL`/`LEARNING` e sfocano tutto il frame finché la FSM non
+attiva la ROI. Il retraining notturno (richiede Python 3.11/3.12 + torch,
+vedi INSTALLAZIONE.md) raffina il classificatore con i falsi positivi
+raccolti; il modello validato viene scambiato a caldo e sopravvive ai
+riavvii.
+
 ## Struttura
 
 | Percorso | Contenuto |
@@ -48,6 +88,7 @@ in `src/README.md`.
 | `src/docker-compose.gpu.yml` | Stack con ONNX Runtime CUDA (feature `cuda`) |
 | `src/python/` | `retrain.py` (retraining notturno), `prepare_seed.py` (seed del classificatore) |
 | `src/scripts/` | Harness di test/esplorazione (`test-wider.ps1`, `eval_wider_output.py`, `blur_compare.py`, …) |
+| root: `start-server.cmd`, `report-camere.ps1`, `alert-retraining.ps1`, … | Strumenti operativi Windows: avvio/stop, report giornaliero e settimanale, alert retraining, rotazione log, validazione classificatore |
 | `models_cache/` | Modelli ONNX scaricati a runtime (ignorati da git, vedi `.gitignore`) |
 
 ## Avvio rapido (backend S3 con MinIO)
@@ -100,9 +141,13 @@ longer shipped with the repository. The full operational reference lives in
   cautious full-frame blur, data collection, **ROI extraction** (DBSCAN →
   convex hull), ROI gate + **binary classifier** + hull/ellipse mask of the
   5 facial landmarks, "head" fallback for pure-profile shots.
+- **Camera identity** — from the **EXIF body serial number** of the frame
+  (`CAMERA_ID_SOURCE=exif`, BodySerialNumber tag) with automatic fallback to
+  the filename-derived identity.
 - **Nightly self-retraining** — PyO3 fine-tuning (MobileNetV2: seed + false
   positives), ONNX export, Rust-side validation, A/B gate, atomic swap with
-  backup, operator-visible JSON audit.
+  backup, operator-visible JSON audit; the swapped model **survives
+  restarts** (restored automatically from persisted state at startup).
 - **S3 storage backend** — asynchronous job intake from S3-compatible buckets
   (MinIO / AWS / Spaces): job submission, output to a bucket, JSON audit logs,
   **completion webhook with a 1-hour presigned URL**, operator batch sweep,
@@ -120,6 +165,40 @@ longer shipped with the repository. The full operational reference lives in
   (cargo feature + `Dockerfile.gpu`), fail-fast when the configured GPU is
   unusable.
 
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [`INSTALLATION.md`](INSTALLATION.md) | **Windows installation and commissioning manual** — prerequisites, build, configuration, camera FSM, operator tooling, and a field log of real pitfalls with their fixes |
+| [`INSTALLAZIONE.md`](INSTALLAZIONE.md) | Italian version of the installation manual |
+| [`ATTIVA-RETRAINING.md`](ATTIVA-RETRAINING.md) | Nightly retraining status, PyO3/ONNX diagnostics and Docker notes |
+| [`src/README.md`](src/README.md) | Full operational reference: architecture, API, config, S3, queues, tuning |
+
+## Quick start (native Windows)
+
+Prerequisites and the full build walkthrough are in
+[INSTALLATION.md](INSTALLATION.md); in short:
+
+```powershell
+# 1) build (from the repo root)
+cargo build --release --manifest-path src/Cargo.toml
+
+# 2) configuration: copy src/.env.example to src/.env and customize
+#    (OPERATOR_API_KEY, paths, CRON_RETRAIN_SCHEDULE, ...)
+
+# 3) one double-click to run: start-server.cmd (loads the .env, launches
+#    the exe, logs to logs\server.log)
+
+# 4) verify
+curl http://localhost:8080/health
+```
+
+The first start downloads the ONNX models (YOLO) into `models_cache/`;
+cameras start in `INITIAL`/`LEARNING` and blur the whole frame until the FSM
+activates the ROI. Nightly retraining (needs Python 3.11/3.12 + torch, see
+INSTALLATION.md) refines the classifier with the collected false positives;
+the validated model is hot-swapped and survives restarts.
+
 ## Repository layout
 
 | Path | Contents |
@@ -131,6 +210,7 @@ longer shipped with the repository. The full operational reference lives in
 | `src/docker-compose.gpu.yml` | Stack with ONNX Runtime CUDA (feature `cuda`) |
 | `src/python/` | `retrain.py` (nightly retraining), `prepare_seed.py` (classifier seed) |
 | `src/scripts/` | Test/exploration harnesses (`test-wider.ps1`, `eval_wider_output.py`, `blur_compare.py`, …) |
+| root: `start-server.cmd`, `report-camere.ps1`, `alert-retraining.ps1`, … | Windows operator tooling: start/stop, daily and weekly reports, retraining alerts, log rotation, classifier validation |
 | `models_cache/` | ONNX models downloaded at runtime (git-ignored, see `.gitignore`) |
 
 ## Quick start (S3 backend with MinIO)
