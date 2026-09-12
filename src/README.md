@@ -1,5 +1,9 @@
 # Anonimizzazione Volti — batch face-anonymization service (Rust + ONNX)
 
+<p align="center">
+  <img src="docs/images/logo-anonimizzazione-visi.jpg" alt="Anonimizzazione Volti" width="420">
+</p>
+
 Industrial-grade microservice that anonymizes (blurs) faces in batches of images
 captured by fixed traffic/ZTL cameras, targeting GDPR compliance: **zero
 visibly-unblurred real faces in the output**, surgical precision via a binary
