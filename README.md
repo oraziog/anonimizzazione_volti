@@ -20,11 +20,6 @@ e apprendimento automatico del ROI per telecamera.
        alt="Flusso di lavoro: ingest dell'archivio, FSM per camera, pipeline di blur e output anonimizzato">
 </p>
 
-Il design rationale è espresso nei sorgenti come commenti `spec §N`; il
-documento di specifica associato era un artefatto di start-up e non è più
-incluso nel repository. Il riferimento operativo completo è
-in `src/README.md`.
-
 ## Cosa fa
 
 - **Ingest batch** — `POST /anonymize` (zip/7z/rar, streaming su disco, mai in
@@ -157,11 +152,6 @@ region-of-interest (ROI) learning.
   <img src="src/docs/images/flusso-di-lavoro-anonimizzazione-visi.jpg"
        alt="Workflow: archive ingest, per-camera FSM, blur pipeline and anonymized output">
 </p>
-
-Design rationale is captured throughout the source as `spec §N` comments;
-the original specification document was an internal startup artifact and is no
-longer shipped with the repository. The full operational reference lives in
-`src/README.md`.
 
 ## What it does
 

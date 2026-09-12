@@ -9,10 +9,6 @@ captured by fixed traffic/ZTL cameras, targeting GDPR compliance: **zero
 visibly-unblurred real faces in the output**, surgical precision via a binary
 classifier, and automated ROI learning per camera.
 
-The design rationale is captured throughout the source as `spec §N`
-comments; the associated specification document was an internal startup
-artifact and is no longer shipped with the repository.
-
 ## Architecture
 
 | Module | Responsibility (spec) |
